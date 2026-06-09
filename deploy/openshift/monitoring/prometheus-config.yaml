@@ -1,0 +1,413 @@
+# Flux OT — PrometheusRule: Alerting Rules for Industrial IoT Platform
+# These rules are evaluated by the Prometheus instance (either OpenShift Monitoring
+# or a standalone Prometheus deployed via the Grafana/Prometheus Operator).
+#
+# Rule groups are organized by concern: safety, connectivity, messaging, API, database.
+# Safety rules (BeltRip, SkidOffline) use shortest evaluation intervals.
+#
+# Apply: oc apply -f prometheus-config.yaml -n fluxot-monitoring
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fluxot-platform-alerts
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: fluxot-prometheus-rules
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    # Label used by Prometheus Operator to discover this rule set
+    role: alert-rules
+    prometheus: fluxot
+spec:
+  groups:
+    # ===========================================================
+    # Safety-critical rules — shortest evaluation intervals
+    # These must fire and notify within seconds of threshold breach.
+    # ===========================================================
+    - name: fluxot.safety.critical
+      interval: 15s    # Evaluate every 15 seconds
+      rules:
+        # -------------------------------------------------------
+        # BeltRipEmergencyStop
+        # Fires if ANY emergency stop writeback message has been
+        # sent to the belt rip topic in the last 5 minutes.
+        # Production action: page on-call immediately.
+        # -------------------------------------------------------
+        - alert: BeltRipEmergencyStop
+          expr: |
+            sum(
+              increase(
+                kafka_topic_partition_current_offset{
+                  topic="fluxot-writeback",
+                  job=~"kafka.*"
+                }[5m]
+              )
+            ) by (topic) > 0
+            and on()
+            sum(
+              increase(
+                fluxot_writeback_emergency_stop_total[5m]
+              )
+            ) > 0
+          for: 0m    # Alert immediately — no wait period for safety events
+          labels:
+            severity: critical
+            team: safety
+            site: "{{ $labels.site_id }}"
+            skid: "{{ $labels.skid_id }}"
+            runbook: "https://wiki.fluxot.internal/runbooks/belt-rip-emergency-stop"
+          annotations:
+            summary: "EMERGENCY STOP activated on belt rip skid {{ $labels.skid_id }}"
+            description: |
+              An emergency stop command has been written back to site {{ $labels.site_id }},
+              skid {{ $labels.skid_id }} in the last 5 minutes.
+              Writeback count: {{ $value }}.
+              Immediate physical inspection required.
+            runbook_url: "https://wiki.fluxot.internal/runbooks/belt-rip-emergency-stop"
+
+        # -------------------------------------------------------
+        # BeltRipHighTension
+        # Fires when belt tension sensor reading exceeds safe threshold.
+        # Uses the fluxot_telemetry_gauge metric emitted by the API.
+        # -------------------------------------------------------
+        - alert: BeltRipHighTension
+          expr: |
+            fluxot_telemetry_gauge{
+              metric_name="belt_tension_kn",
+              skid_type="belt-rip"
+            } > 150
+          for: 30s
+          labels:
+            severity: warning
+            team: operations
+            runbook: "https://wiki.fluxot.internal/runbooks/belt-rip-high-tension"
+          annotations:
+            summary: "Belt tension high on {{ $labels.skid_id }} ({{ $value }} kN)"
+            description: |
+              Belt tension on skid {{ $labels.skid_id }} at site {{ $labels.site_id }}
+              is {{ $value }} kN, exceeding the 150 kN warning threshold.
+
+    # ===========================================================
+    # Connectivity rules
+    # ===========================================================
+    - name: fluxot.connectivity
+      interval: 30s
+      rules:
+        # -------------------------------------------------------
+        # SkidOffline
+        # Fires when a skid has not sent a heartbeat for 2 minutes.
+        # Each skid sends heartbeats every 30 seconds; missing 4
+        # consecutive beats indicates a connectivity or power issue.
+        # -------------------------------------------------------
+        - alert: SkidOffline
+          expr: |
+            (
+              time() - fluxot_skid_last_heartbeat_timestamp_seconds
+            ) > 120
+          for: 0m    # Fire immediately once the threshold is crossed
+          labels:
+            severity: critical
+            team: operations
+            runbook: "https://wiki.fluxot.internal/runbooks/skid-offline"
+          annotations:
+            summary: "Skid {{ $labels.skid_id }} at {{ $labels.site_id }} is offline"
+            description: |
+              No heartbeat received from skid {{ $labels.skid_id }} at site {{ $labels.site_id }}
+              for {{ $value | humanizeDuration }}.
+              Last seen: {{ $labels.last_seen }}.
+              Check: MQTT connectivity, edge pod status, network path to broker.
+            runbook_url: "https://wiki.fluxot.internal/runbooks/skid-offline"
+
+        # -------------------------------------------------------
+        # SkidHeartbeatMissing (via Kafka topic lag proxy)
+        # Uses Kafka exporter to detect a stalled heartbeat consumer.
+        # -------------------------------------------------------
+        - alert: SkidHeartbeatTopicStalled
+          expr: |
+            kafka_consumergroup_lag{
+              consumergroup=~"fluxot-api-heartbeat-group",
+              topic="fluxot-heartbeat"
+            } > 100
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Heartbeat Kafka consumer lag is {{ $value }} messages"
+            description: |
+              Consumer group {{ $labels.consumergroup }} on topic {{ $labels.topic }}
+              has a lag of {{ $value }} messages, indicating the heartbeat processor
+              may be falling behind or has stalled.
+
+    # ===========================================================
+    # Kafka / messaging rules
+    # ===========================================================
+    - name: fluxot.messaging.kafka
+      interval: 30s
+      rules:
+        # -------------------------------------------------------
+        # KafkaConsumerLag
+        # Fires when any consumer group lag exceeds 10,000 messages.
+        # This indicates a processing backlog that may lead to
+        # data staleness in the platform.
+        # -------------------------------------------------------
+        - alert: KafkaConsumerLag
+          expr: |
+            sum(kafka_consumergroup_lag) by (consumergroup, topic) > 10000
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            runbook: "https://wiki.fluxot.internal/runbooks/kafka-consumer-lag"
+          annotations:
+            summary: "Kafka consumer lag: {{ $labels.consumergroup }} on {{ $labels.topic }} = {{ $value }}"
+            description: |
+              Consumer group {{ $labels.consumergroup }} has a lag of {{ $value }} messages
+              on topic {{ $labels.topic }}.
+              This may indicate a stuck consumer, processing error, or insufficient
+              consumer replicas. Check pod logs and deployment status.
+            runbook_url: "https://wiki.fluxot.internal/runbooks/kafka-consumer-lag"
+
+        - alert: KafkaConsumerLagCritical
+          expr: |
+            sum(kafka_consumergroup_lag) by (consumergroup, topic) > 50000
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "CRITICAL Kafka lag: {{ $labels.consumergroup }}/{{ $labels.topic }} = {{ $value }}"
+            description: |
+              Consumer group {{ $labels.consumergroup }} has a critical lag of {{ $value }}
+              messages on topic {{ $labels.topic }}.
+              Telemetry data is severely delayed. Immediate intervention required.
+
+        # -------------------------------------------------------
+        # KafkaBrokerDown — broker pod not running
+        # -------------------------------------------------------
+        - alert: KafkaBrokerDown
+          expr: |
+            count(
+              kafka_server_replicamanager_leadercount
+            ) < 3
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Kafka cluster has fewer than 3 active brokers"
+            description: |
+              Expected 3 Kafka brokers; currently only {{ $value }} are reporting metrics.
+              Under-replicated partitions may cause message loss.
+
+        # -------------------------------------------------------
+        # KafkaUnderReplicatedPartitions
+        # -------------------------------------------------------
+        - alert: KafkaUnderReplicatedPartitions
+          expr: |
+            sum(kafka_server_replicamanager_underreplicatedpartitions) by (pod) > 0
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Kafka broker {{ $labels.pod }} has under-replicated partitions: {{ $value }}"
+            description: |
+              {{ $value }} partitions are under-replicated on broker {{ $labels.pod }}.
+              This reduces fault tolerance. Check for broker restarts or network issues.
+
+    # ===========================================================
+    # Alert rate rules — detect alert storms
+    # ===========================================================
+    - name: fluxot.alerting
+      interval: 60s
+      rules:
+        # -------------------------------------------------------
+        # HighAlertRate
+        # Fires if the platform is receiving more than 10 alerts/min
+        # for a sustained 5-minute window — indicates a fault cascade
+        # or misconfigured threshold.
+        # -------------------------------------------------------
+        - alert: HighAlertRate
+          expr: |
+            rate(fluxot_alerts_received_total[5m]) * 60 > 10
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            runbook: "https://wiki.fluxot.internal/runbooks/high-alert-rate"
+          annotations:
+            summary: "High alert rate: {{ $value | humanize }} alerts/min"
+            description: |
+              The platform is receiving {{ $value | humanize }} alerts per minute,
+              sustained for 5 minutes. This may indicate:
+              - A fault cascade across multiple skids
+              - Incorrectly configured alerting thresholds
+              - A connectivity storm causing reconnect-triggered alerts
+              Check the Grafana alert dashboard for site/skid breakdown.
+
+        - alert: AlertStormCritical
+          expr: |
+            rate(fluxot_alerts_received_total[1m]) * 60 > 100
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "ALERT STORM: {{ $value | humanize }} alerts/min"
+            description: |
+              Over 100 alerts/minute detected. Possible runaway alerting loop or
+              mass equipment failure event. Investigate immediately.
+
+    # ===========================================================
+    # API health rules
+    # ===========================================================
+    - name: fluxot.api
+      interval: 30s
+      rules:
+        # -------------------------------------------------------
+        # APIHighErrorRate
+        # Fires if >5% of API requests return 5xx errors over 5 minutes.
+        # -------------------------------------------------------
+        - alert: APIHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{
+                job="fluxot-platform-api",
+                status_code=~"5.."
+              }[5m]))
+              /
+              sum(rate(http_requests_total{
+                job="fluxot-platform-api"
+              }[5m]))
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            runbook: "https://wiki.fluxot.internal/runbooks/api-high-error-rate"
+          annotations:
+            summary: "Platform API 5xx error rate {{ $value | humanizePercentage }}"
+            description: |
+              The Platform API is returning {{ $value | humanizePercentage }} 5xx errors
+              over the past 5 minutes (threshold: 5%).
+              Check API pod logs, database connectivity, and Kafka broker status.
+            runbook_url: "https://wiki.fluxot.internal/runbooks/api-high-error-rate"
+
+        # -------------------------------------------------------
+        # APIHighLatency — P95 response time > 2 seconds
+        # -------------------------------------------------------
+        - alert: APIHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{
+                job="fluxot-platform-api"
+              }[5m])) by (le, handler)
+            ) > 2.0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "API P95 latency {{ $value | humanizeDuration }} on {{ $labels.handler }}"
+            description: |
+              95th percentile request latency on handler {{ $labels.handler }} is
+              {{ $value | humanizeDuration }}, exceeding the 2-second SLO.
+
+        # -------------------------------------------------------
+        # APIPodsUnavailable — fewer replicas than desired
+        # -------------------------------------------------------
+        - alert: APIPodsUnavailable
+          expr: |
+            kube_deployment_status_replicas_available{
+              deployment="fluxot-platform-api",
+              namespace="fluxot-platform"
+            } < kube_deployment_spec_replicas{
+              deployment="fluxot-platform-api",
+              namespace="fluxot-platform"
+            }
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Platform API has {{ $value }} fewer replicas than desired"
+            description: |
+              The fluxot-platform-api deployment has {{ $value }} unavailable replicas.
+              Check pod events and resource availability.
+
+    # ===========================================================
+    # Database rules
+    # ===========================================================
+    - name: fluxot.database
+      interval: 30s
+      rules:
+        # -------------------------------------------------------
+        # DatabaseConnectionPoolExhaustion
+        # Fires when pgBouncer / application pool utilisation > 90%.
+        # Indicates the DB tier needs vertical scaling or query optimisation.
+        # -------------------------------------------------------
+        - alert: DatabaseConnectionPoolExhaustion
+          expr: |
+            (
+              pg_stat_activity_count{state="active"}
+              /
+              pg_settings_max_connections
+            ) > 0.90
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            runbook: "https://wiki.fluxot.internal/runbooks/db-connection-pool"
+          annotations:
+            summary: "TimescaleDB connection pool {{ $value | humanizePercentage }} utilised"
+            description: |
+              TimescaleDB active connections are at {{ $value | humanizePercentage }} of
+              max_connections. New application connections may be rejected.
+              Consider: adding pgBouncer, optimising long-running queries,
+              or scaling max_connections.
+
+        # -------------------------------------------------------
+        # DatabaseReplicationLag (for future HA replica setup)
+        # -------------------------------------------------------
+        - alert: DatabaseReplicationLag
+          expr: |
+            pg_replication_lag > 30
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "TimescaleDB replication lag {{ $value | humanizeDuration }}"
+            description: |
+              Streaming replication lag is {{ $value }} seconds, exceeding the 30-second
+              threshold. RPO is at risk if the primary fails.
+
+        # -------------------------------------------------------
+        # DatabaseDiskUsageHigh
+        # -------------------------------------------------------
+        - alert: DatabaseDiskUsageHigh
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes{
+                namespace="fluxot-platform",
+                persistentvolumeclaim=~"timescaledb-data.*"
+              }
+              /
+              kubelet_volume_stats_capacity_bytes{
+                namespace="fluxot-platform",
+                persistentvolumeclaim=~"timescaledb-data.*"
+              }
+            ) > 0.80
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "TimescaleDB PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+            description: |
+              The TimescaleDB persistent volume {{ $labels.persistentvolumeclaim }} is
+              {{ $value | humanizePercentage }} full. Plan to expand the PVC or
+              verify TimescaleDB compression/retention policies are running.

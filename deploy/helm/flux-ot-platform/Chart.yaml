@@ -1,0 +1,66 @@
+apiVersion: v2
+name: flux-ot-platform
+description: Flux OT Industrial IoT Integration Platform — OpenShift deployment chart
+  providing the complete platform stack including API, MQTT bridge, TimescaleDB,
+  Redis, and observability components for industrial OT/IT convergence use cases
+  such as mining, oil & gas, and heavy industry.
+
+type: application
+
+# Chart version — increment on every chart change following semver
+version: 1.0.0
+
+# Application version — tracks the platform release, not the chart
+appVersion: "1.0.0"
+
+keywords:
+  - iot
+  - industrial
+  - mining
+  - oil-gas
+  - opc-ua
+  - mqtt
+  - kafka
+  - timescaledb
+  - openshift
+  - edge-computing
+  - predictive-maintenance
+
+home: https://fluxot.internal
+sources:
+  - https://github.com/fluxot/platform
+
+maintainers:
+  - name: Flux OT Platform Team
+    email: platform@fluxot.io
+    url: https://fluxot.internal
+
+annotations:
+  # Artifact Hub / OpenShift console annotations
+  artifacthub.io/category: integration-delivery
+  artifacthub.io/license: Proprietary
+  artifacthub.io/operator: "false"
+  # OpenShift Helm chart annotations
+  charts.openshift.io/name: flux-ot-platform
+  charts.openshift.io/provider: "Flux OT"
+  charts.openshift.io/supportURL: https://support.fluxot.internal
+
+dependencies:
+  # PostgreSQL (Bitnami) — used only when timescaledb.useStandalone=true
+  # For production, switch to timescaledb-ha or CrunchyData PGO operator.
+  - name: postgresql
+    version: "15.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+    alias: postgresql
+    tags:
+      - database
+
+  # Redis (Bitnami) — session cache, rate limiting, pub/sub for realtime features
+  - name: redis
+    version: "19.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+    alias: redis
+    tags:
+      - cache

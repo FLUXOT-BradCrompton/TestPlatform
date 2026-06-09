@@ -1,0 +1,377 @@
+# Flux OT — Grafana Operator GrafanaInstance, DataSources, and RBAC
+# Requires: grafana-operator v5+ installed in fluxot-monitoring namespace.
+#
+# Apply: oc apply -f grafana-instance.yaml -n fluxot-monitoring
+---
+# ============================================================
+# Grafana instance
+# ============================================================
+apiVersion: grafana.integreatly.org/v1beta1
+kind: Grafana
+metadata:
+  name: fluxot-grafana
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    # Label used by GrafanaDashboard/GrafanaDataSource resources to target this instance
+    dashboards: "fluxot"
+spec:
+  # --------------------------------------------------------
+  # Deployment config
+  # --------------------------------------------------------
+  deployment:
+    spec:
+      replicas: 2     # HA pair for monitoring availability
+      selector:
+        matchLabels:
+          app: grafana
+      template:
+        metadata:
+          labels:
+            app: grafana
+            app.kubernetes.io/part-of: fluxot-platform
+            environment: production
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 472     # Grafana default uid
+            fsGroup: 472
+            seccompProfile:
+              type: RuntimeDefault
+
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        app: grafana
+                    topologyKey: kubernetes.io/hostname
+
+          containers:
+            - name: grafana
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 472
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false  # Grafana writes plugin data
+                capabilities:
+                  drop: [ALL]
+              env:
+                # Admin credentials from secret
+                - name: GF_SECURITY_ADMIN_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: fluxot-grafana-credentials
+                      key: GF_SECURITY_ADMIN_USER
+                - name: GF_SECURITY_ADMIN_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: fluxot-grafana-credentials
+                      key: GF_SECURITY_ADMIN_PASSWORD
+
+  # --------------------------------------------------------
+  # Grafana INI configuration
+  # --------------------------------------------------------
+  config:
+    # Server
+    server:
+      root_url: "https://grafana.apps.ocp4.fluxot.internal"
+      enable_gzip: "true"
+
+    # Authentication — OpenShift OAuth integration
+    auth.generic_oauth:
+      enabled: "true"
+      name: "OpenShift"
+      allow_sign_up: "true"
+      # These values are injected from a Secret in production
+      client_id: "grafana-oauth"
+      client_secret: "${GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET}"
+      scopes: "user:info user:check-access user:list-projects"
+      auth_url: "https://oauth-openshift.apps.ocp4.fluxot.internal/oauth/authorize"
+      token_url: "https://oauth-openshift.apps.ocp4.fluxot.internal/oauth/token"
+      api_url: "https://openshift.default.svc.cluster.local/apis/user.openshift.io/v1/users/~"
+      tls_skip_verify_insecure: "false"
+
+    # Role mapping from OpenShift groups to Grafana roles
+    auth:
+      auto_assign_org: "true"
+      auto_assign_org_role: "Viewer"
+
+    # Disable anonymous access
+    auth.anonymous:
+      enabled: "false"
+
+    # Logging
+    log:
+      mode: console
+      level: warn
+
+    # Alerting (Grafana managed alerts — use in addition to Prometheus rules)
+    alerting:
+      enabled: "true"
+
+    # Unified alerting
+    unified_alerting:
+      enabled: "true"
+
+    # Feature toggles
+    feature_toggles:
+      enable: "ngalert,tracing,publicDashboards"
+
+    # Security hardening
+    security:
+      disable_gravatar: "true"
+      cookie_secure: "true"
+      strict_transport_security: "true"
+      content_type_protection: "true"
+      x_content_type_options: "true"
+      x_xss_protection: "true"
+
+    # Snapshot sharing — disable for production (prevent data leakage)
+    snapshots:
+      external_enabled: "false"
+
+  # --------------------------------------------------------
+  # External access via OpenShift Route
+  # --------------------------------------------------------
+  route:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: fluxot-platform
+        environment: production
+      annotations:
+        haproxy.router.openshift.io/timeout: 60s
+    spec:
+      host: "grafana.apps.ocp4.fluxot.internal"
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+      to:
+        kind: Service
+        name: fluxot-grafana-service
+        weight: 100
+      wildcardPolicy: None
+
+  # --------------------------------------------------------
+  # Persistent storage for Grafana SQLite database
+  # --------------------------------------------------------
+  persistentVolumeClaim:
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: gp3-csi
+      resources:
+        requests:
+          storage: 10Gi
+---
+# ============================================================
+# GrafanaDataSource — Prometheus
+# ============================================================
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDataSource
+metadata:
+  name: fluxot-prometheus-datasource
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  # Target the Grafana instance with matching label
+  instanceSelector:
+    matchLabels:
+      dashboards: "fluxot"
+  datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      uid: prometheus-fluxot
+      url: "http://prometheus-operated.fluxot-monitoring.svc.cluster.local:9090"
+      isDefault: true
+      editable: false
+      jsonData:
+        timeInterval: "15s"
+        queryTimeout: "60s"
+        httpMethod: "POST"
+        # Enable exemplars for trace correlation
+        exemplarTraceIdDestinations:
+          - name: traceID
+            datasourceUid: tempo-fluxot
+      version: 1
+---
+# ============================================================
+# GrafanaDataSource — TimescaleDB (via PostgreSQL plugin)
+# ============================================================
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDataSource
+metadata:
+  name: fluxot-timescaledb-datasource
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: "fluxot"
+  datasources:
+    - name: TimescaleDB
+      type: grafana-postgresql-datasource
+      access: proxy
+      uid: timescaledb-fluxot
+      url: "fluxot-timescaledb.fluxot-platform.svc.cluster.local:5432"
+      editable: false
+      jsonData:
+        database: fluxot
+        sslmode: require
+        maxOpenConns: 10
+        maxIdleConns: 5
+        connMaxLifetime: 14400
+        postgresVersion: 1600    # PostgreSQL 16
+        timescaledb: true
+        tlsAuth: false
+        tlsAuthWithCACert: false
+      secureJsonData:
+        password: "${TIMESCALEDB_GRAFANA_PASSWORD}"
+      user: "fluxot_grafana_ro"
+      version: 1
+---
+# ============================================================
+# GrafanaDataSource — Redis (via Redis plugin for real-time metrics)
+# ============================================================
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDataSource
+metadata:
+  name: fluxot-redis-datasource
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: "fluxot"
+  datasources:
+    - name: Redis
+      type: redis-datasource
+      access: proxy
+      uid: redis-fluxot
+      url: "redis://fluxot-redis-master.fluxot-platform.svc.cluster.local:6379"
+      editable: false
+      jsonData:
+        poolSize: 5
+        timeout: 10
+        pingInterval: 0
+        pipelineWindow: 0
+      version: 1
+---
+# ============================================================
+# RBAC — ClusterRole for read-only operators
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grafana-operator-read-only
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules", "servicemonitors", "podmonitors"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grafana-operators-read-only
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+subjects:
+  # OpenShift group for operations team — read-only Grafana dashboard access
+  - kind: Group
+    name: fluxot-operators
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: grafana-operator-read-only
+  apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
+# RBAC — Admin access for platform team
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grafana-platform-admin
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+rules:
+  - apiGroups: ["grafana.integreatly.org"]
+    resources: ["grafanas", "grafanadatasources", "grafanadashboards", "grafanafolders"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules", "servicemonitors", "podmonitors", "alertmanagerconfigs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grafana-platform-team-admin
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+subjects:
+  - kind: Group
+    name: fluxot-platform-team
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: grafana-platform-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
+# Secret template for Grafana credentials
+# Replace placeholder values before applying.
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fluxot-grafana-credentials
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+  annotations:
+    fluxot.io/secret-management: "sealed-secrets-or-vault"
+type: Opaque
+stringData:
+  GF_SECURITY_ADMIN_USER: "admin"
+  GF_SECURITY_ADMIN_PASSWORD: "<PLACEHOLDER_GRAFANA_ADMIN_PASSWORD>"
+  TIMESCALEDB_GRAFANA_PASSWORD: "<PLACEHOLDER_TIMESCALEDB_GRAFANA_RO_PASSWORD>"
+  GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: "<PLACEHOLDER_OAUTH_CLIENT_SECRET>"
