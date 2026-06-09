@@ -1,0 +1,78 @@
+# Flux OT Edge — K3s Namespace for Edge Device Services
+# Applied on the edge K3s cluster running on the industrial skid.
+# Each skid runs a single K3s node (or a 2-node HA pair for critical sites).
+#
+# Apply: kubectl apply -f edge-namespace.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluxot-edge
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: edge
+    environment: production
+    # Edge-specific label — used by nodeSelectors and affinity rules
+    tier: edge
+  annotations:
+    fluxot.io/site-id: "${SITE_ID}"    # Replaced by deploy-edge.sh at deploy time
+    fluxot.io/description: "Flux OT edge services — belt rip monitor, road crossing, OPC-UA bridge"
+---
+# ResourceQuota — edge nodes are constrained hardware (Intel NUC / industrial PC)
+# Total budget: ~4 CPU / 8 GiB RAM typical for a site controller
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fluxot-edge-quota
+  namespace: fluxot-edge
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    tier: edge
+spec:
+  hard:
+    # Leave headroom for K3s system components and OS
+    requests.cpu: "2"
+    requests.memory: "2Gi"
+    limits.cpu: "4"
+    limits.memory: "4Gi"
+    requests.storage: "50Gi"
+    persistentvolumeclaims: "10"
+    count/pods: "20"
+    count/services: "10"
+    count/configmaps: "10"
+    count/secrets: "10"
+    count/deployments.apps: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fluxot-edge-limits
+  namespace: fluxot-edge
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    tier: edge
+spec:
+  limits:
+    - type: Container
+      # Conservative defaults for edge hardware
+      default:
+        cpu: "200m"
+        memory: "256Mi"
+      defaultRequest:
+        cpu: "50m"
+        memory: "64Mi"
+      max:
+        cpu: "1"
+        memory: "1Gi"
+      min:
+        cpu: "10m"
+        memory: "16Mi"
+    - type: Pod
+      max:
+        cpu: "2"
+        memory: "2Gi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "20Gi"
+      min:
+        storage: "100Mi"

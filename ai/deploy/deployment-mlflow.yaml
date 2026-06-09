@@ -1,0 +1,398 @@
+# ===========================================================================
+# Flux OT — MLflow Tracking Server Deployment
+#
+# Backend store : PostgreSQL (fluxot-platform namespace, existing TimescaleDB
+#                 or dedicated mlflow-postgres StatefulSet)
+# Artifact store: MinIO (S3-compatible) in fluxot-platform namespace
+# UI             : Exposed via OpenShift Route at mlflow.fluxot.internal
+#
+# Prerequisites:
+#   - Secret  fluxot-mlflow-secrets (see below) must exist with DB credentials
+#   - Secret  fluxot-minio-secrets  must exist with S3 credentials
+#   - PostgreSQL accessible at mlflow-postgres:5432 (or update MLFLOW_BACKEND_STORE_URI)
+#   - MinIO / S3 bucket "fluxot-mlflow-artifacts" must exist
+#
+# Apply:
+#   oc apply -f deployment-mlflow.yaml
+# ===========================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluxot-mlflow
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-mlflow
+    app.kubernetes.io/name: fluxot-mlflow
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ml-tracking
+    app.kubernetes.io/version: "2.13.0"
+    environment: production
+  annotations:
+    openshift.io/description: "MLflow tracking server — experiment tracking and model registry for Flux OT AI services"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluxot-mlflow
+  strategy:
+    type: Recreate   # single replica with PVC — Recreate avoids multi-attach issues
+  template:
+    metadata:
+      labels:
+        app: fluxot-mlflow
+        app.kubernetes.io/name: fluxot-mlflow
+        app.kubernetes.io/part-of: fluxot-platform
+        app.kubernetes.io/component: ml-tracking
+        environment: production
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      serviceAccountName: fluxot-mlflow-sa
+
+      initContainers:
+        # Wait for PostgreSQL to be ready before starting MLflow
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for PostgreSQL at mlflow-postgres:5432 ..."
+              until nc -z mlflow-postgres 5432; do
+                sleep 2
+              done
+              echo "PostgreSQL is ready."
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: mlflow
+          # MLflow 2.13.0 official image
+          image: ghcr.io/mlflow/mlflow:v2.13.0
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - mlflow
+            - server
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "5000"
+            - --backend-store-uri
+            - $(MLFLOW_BACKEND_STORE_URI)
+            - --default-artifact-root
+            - $(MLFLOW_DEFAULT_ARTIFACT_ROOT)
+            - --serve-artifacts
+            - --artifacts-destination
+            - $(MLFLOW_ARTIFACTS_DESTINATION)
+            - --workers
+            - "2"
+            - --gunicorn-opts
+            - "--timeout 120"
+
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+
+          env:
+            # PostgreSQL backend store
+            - name: MLFLOW_BACKEND_STORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-mlflow-secrets
+                  key: backend_store_uri
+            # e.g. postgresql://mlflow:secret@mlflow-postgres:5432/mlflow
+
+            # S3/MinIO artifact store
+            - name: MLFLOW_DEFAULT_ARTIFACT_ROOT
+              value: "s3://fluxot-mlflow-artifacts"
+            - name: MLFLOW_ARTIFACTS_DESTINATION
+              value: "s3://fluxot-mlflow-artifacts"
+
+            # MinIO S3 credentials
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-minio-secrets
+                  key: access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-minio-secrets
+                  key: secret_access_key
+            - name: MLFLOW_S3_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fluxot-mlflow-config
+                  key: minio_endpoint_url
+            # e.g. http://minio.fluxot-platform.svc.cluster.local:9000
+
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1  # MinIO ignores region but boto3 requires a value
+
+            # Auth (basic HTTP auth via reverse proxy or Gunicorn)
+            - name: MLFLOW_TRACKING_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-mlflow-secrets
+                  key: tracking_username
+            - name: MLFLOW_TRACKING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-mlflow-secrets
+                  key: tracking_password
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+
+          volumeMounts:
+            - name: mlflow-tmp
+              mountPath: /tmp
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # MLflow writes temp files
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: mlflow-tmp
+          emptyDir:
+            sizeLimit: "500Mi"
+
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          operator: Exists
+          effect: NoSchedule
+---
+# ---------------------------------------------------------------------------
+# PostgreSQL StatefulSet for MLflow backend store
+# (Use this if you don't have an existing Postgres available.)
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mlflow-postgres
+  namespace: fluxot-ai
+  labels:
+    app: mlflow-postgres
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ml-tracking-db
+    environment: production
+spec:
+  serviceName: mlflow-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow-postgres
+  template:
+    metadata:
+      labels:
+        app: mlflow-postgres
+        app.kubernetes.io/part-of: fluxot-platform
+        environment: production
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999    # postgres uid
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: mlflow
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-mlflow-secrets
+                  key: db_user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-mlflow-secrets
+                  key: db_password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mlflow", "-d", "mlflow"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mlflow", "-d", "mlflow"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app: mlflow-postgres
+          environment: production
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxot-mlflow
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-mlflow
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  selector:
+    app: fluxot-mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-postgres
+  namespace: fluxot-ai
+  labels:
+    app: mlflow-postgres
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  selector:
+    app: mlflow-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  type: ClusterIP
+  clusterIP: None   # Headless for StatefulSet DNS
+---
+# ---------------------------------------------------------------------------
+# OpenShift Route — MLflow UI
+# ---------------------------------------------------------------------------
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: fluxot-mlflow
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-mlflow
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+  annotations:
+    haproxy.router.openshift.io/timeout: "60s"
+spec:
+  host: mlflow.fluxot.internal
+  to:
+    kind: Service
+    name: fluxot-mlflow
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+# ---------------------------------------------------------------------------
+# ServiceAccount
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluxot-mlflow-sa
+  namespace: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+---
+# ---------------------------------------------------------------------------
+# ConfigMap
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-mlflow-config
+  namespace: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+data:
+  minio_endpoint_url: "http://minio.fluxot-platform.svc.cluster.local:9000"
+  artifact_bucket: "fluxot-mlflow-artifacts"

@@ -1,0 +1,68 @@
+{{/*
+Flux OT Platform — HorizontalPodAutoscaler (Helm-templated)
+Only rendered when .Values.platformApi.autoscaling.enabled is true.
+*/}}
+{{- if and .Values.platformApi.enabled .Values.platformApi.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-api-hpa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  {{- with (include "flux-ot-platform.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "flux-ot-platform.fullname" . }}-api
+
+  minReplicas: {{ .Values.platformApi.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.platformApi.autoscaling.maxReplicas }}
+
+  metrics:
+    {{- if .Values.platformApi.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.platformApi.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.platformApi.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.platformApi.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+
+  behavior:
+    scaleDown:
+      # Industrial workloads: 5-minute cooldown prevents premature scale-down after burst
+      stabilizationWindowSeconds: {{ .Values.platformApi.autoscaling.scaleDownStabilizationWindowSeconds | default 300 }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min
+    scaleUp:
+      stabilizationWindowSeconds: {{ .Values.platformApi.autoscaling.scaleUpStabilizationWindowSeconds | default 0 }}
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+        - type: Percent
+          value: 50
+          periodSeconds: 30
+      selectPolicy: Max
+{{- end }}

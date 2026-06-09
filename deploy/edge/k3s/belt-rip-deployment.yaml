@@ -1,0 +1,330 @@
+# Flux OT Edge — Belt Rip Monitor Deployment (K3s)
+# Runs on the physical skid controller alongside the conveyor belt.
+# Reads sensor data via Modbus/OPC-UA, publishes to MQTT, and watches
+# for emergency stop commands.
+#
+# Node selection: skid-type=belt-rip label must be applied to the K3s node:
+#   kubectl label node <node-name> skid-type=belt-rip site-id=<site-id>
+#
+# Serial device (Modbus RTU): /dev/ttyUSB0 is exposed via hostPath volume.
+# If the site uses Modbus TCP or OPC-UA over Ethernet, remove the serial volume.
+#
+# Apply: kubectl apply -f belt-rip-deployment.yaml -n fluxot-edge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluxot-belt-rip-monitor
+  namespace: fluxot-edge
+  labels:
+    app: fluxot-belt-rip-monitor
+    app.kubernetes.io/name: belt-rip-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: edge-sensor
+    skid-type: belt-rip
+    environment: production
+  annotations:
+    fluxot.io/skid-type: "belt-rip"
+    fluxot.io/protocols: "modbus-rtu,opc-ua,mqtt"
+spec:
+  # Single replica — one pod per physical skid
+  # High availability is achieved at the site level (redundant skid controller),
+  # not via Kubernetes pod replication.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluxot-belt-rip-monitor
+  strategy:
+    # Recreate ensures the single pod fully stops before the new one starts,
+    # preventing two pods from simultaneously holding the serial port / OPC-UA session.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: fluxot-belt-rip-monitor
+        app.kubernetes.io/name: belt-rip-monitor
+        app.kubernetes.io/part-of: fluxot-platform
+        app.kubernetes.io/component: edge-sensor
+        skid-type: belt-rip
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      # --------------------------------------------------------
+      # Node selection — must run on the belt rip skid controller node
+      # --------------------------------------------------------
+      nodeSelector:
+        skid-type: belt-rip
+
+      # Tolerate edge hardware taints (optional — applied if node is dedicated)
+      tolerations:
+        - key: "fluxot.io/edge-device"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 300   # Allow 5 minutes before evicting (network outage tolerance)
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 300
+
+      # Edge pods must not use host network — use ClusterIP instead
+      hostNetwork: false
+      # No host PID — edge sensors only need device access via volumes
+      hostPID: false
+      hostIPC: false
+
+      securityContext:
+        runAsNonRoot: false   # Modbus serial access may require root or dialout group
+        runAsUser: 0          # Override if image runs as non-root and has dialout group
+        fsGroup: 20           # dialout group GID for /dev/tty* access
+        seccompProfile:
+          type: RuntimeDefault
+
+      serviceAccountName: fluxot-edge-belt-rip-sa
+      terminationGracePeriodSeconds: 30
+
+      # --------------------------------------------------------
+      # Init: wait for MQTT broker connectivity before starting sensor
+      # --------------------------------------------------------
+      initContainers:
+        - name: wait-for-mqtt
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for MQTT broker at ${MQTT_BROKER_HOST}:${MQTT_BROKER_PORT}..."
+              until nc -z "${MQTT_BROKER_HOST}" "${MQTT_BROKER_PORT}"; do
+                echo "  MQTT not reachable, retrying in 5s..."
+                sleep 5
+              done
+              echo "MQTT broker is reachable."
+          envFrom:
+            - configMapRef:
+                name: fluxot-edge-config
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "32Mi"
+
+      # --------------------------------------------------------
+      # Main container
+      # --------------------------------------------------------
+      containers:
+        - name: belt-rip-monitor
+          image: fluxot/belt-rip-monitor:1.0.0
+          imagePullPolicy: IfNotPresent   # Edge: prefer cached image to survive outages
+
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          # Edge devices may require privileged access for serial/USB
+          # Reduce to minimum required — remove if using Modbus TCP
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [SYS_RAWIO]    # Required for low-level serial access on some devices
+
+          envFrom:
+            - configMapRef:
+                name: fluxot-edge-config
+            - secretRef:
+                name: fluxot-edge-secrets
+
+          env:
+            - name: SERVICE_TYPE
+              value: "belt-rip"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Site and skid identity from node labels (populated by deploy script)
+            - name: SITE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['site-id']
+
+          # ---- Resource limits — edge-constrained hardware ----
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "400m"
+              memory: "512Mi"
+
+          # ---- Liveness: check that the MQTT heartbeat topic is active ----
+          # The belt rip monitor publishes a heartbeat message every 30 seconds.
+          # If no heartbeat has been published for 90 seconds, restart the pod.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Check that the process is publishing heartbeats
+                  # The monitor writes a timestamp to /tmp/last_heartbeat on each publish
+                  LAST=$(cat /tmp/last_heartbeat 2>/dev/null || echo 0)
+                  NOW=$(date +%s)
+                  AGE=$((NOW - LAST))
+                  if [ "$AGE" -gt 90 ]; then
+                    echo "Heartbeat stale: ${AGE}s ago"
+                    exit 1
+                  fi
+                  echo "Heartbeat OK: ${AGE}s ago"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Ready when MQTT connection is established and Modbus is responding
+                  test -f /tmp/ready && echo "Ready" || exit 1
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # ---- Volume mounts ----
+          volumeMounts:
+            # Writable /tmp for heartbeat timestamp and runtime state
+            - name: tmp-volume
+              mountPath: /tmp
+            # Modbus serial device (Modbus RTU via USB-RS485 adapter)
+            # Remove this mount if using Modbus TCP or OPC-UA over Ethernet
+            - name: serial-device
+              mountPath: /dev/ttyUSB0
+            # MQTT TLS certificates
+            - name: mqtt-tls
+              mountPath: /etc/mqtt/tls
+              readOnly: true
+            # Sensor configuration (thresholds, calibration values)
+            - name: sensor-config
+              mountPath: /etc/fluxot/belt-rip
+              readOnly: true
+
+      # --------------------------------------------------------
+      # Volumes
+      # --------------------------------------------------------
+      volumes:
+        - name: tmp-volume
+          emptyDir:
+            sizeLimit: "64Mi"
+        # Serial device — USB-to-RS485 adapter for Modbus RTU
+        # The device path may differ; check: ls /dev/ttyUSB* on the node
+        - name: serial-device
+          hostPath:
+            path: /dev/ttyUSB0
+            type: CharDevice
+        - name: mqtt-tls
+          secret:
+            secretName: fluxot-edge-mqtt-tls
+            defaultMode: 0440
+        - name: sensor-config
+          configMap:
+            name: fluxot-belt-rip-config
+            defaultMode: 0444
+---
+# ============================================================
+# ServiceAccount
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluxot-edge-belt-rip-sa
+  namespace: fluxot-edge
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: edge-sensor
+    skid-type: belt-rip
+    environment: production
+---
+# ============================================================
+# Belt-rip specific sensor ConfigMap (thresholds, calibration)
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-belt-rip-config
+  namespace: fluxot-edge
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    skid-type: belt-rip
+    environment: production
+data:
+  sensor.yaml: |
+    # Belt Rip Monitor — Sensor Configuration
+    modbus:
+      # Adjust slave_id and register addresses for actual PLC model
+      slave_id: 1
+      baud_rate: 9600
+      parity: N
+      stop_bits: 1
+      data_bits: 8
+      poll_interval_ms: 500
+      registers:
+        belt_speed_rpm:
+          address: 0x0001
+          type: holding
+          scale: 0.1
+          unit: rpm
+        belt_tension_kn:
+          address: 0x0002
+          type: holding
+          scale: 0.01
+          unit: kN
+        motor_current_a:
+          address: 0x0003
+          type: holding
+          scale: 0.1
+          unit: A
+        emergency_stop_active:
+          address: 0x0100
+          type: coil
+          unit: bool
+        belt_rip_detected:
+          address: 0x0101
+          type: coil
+          unit: bool
+
+    thresholds:
+      belt_tension_warning_kn: 130
+      belt_tension_critical_kn: 150
+      belt_speed_min_rpm: 10
+      belt_speed_max_rpm: 200
+      motor_current_max_a: 50
+
+    heartbeat_interval_seconds: 30
+    telemetry_interval_seconds: 5
+    alert_debounce_seconds: 10

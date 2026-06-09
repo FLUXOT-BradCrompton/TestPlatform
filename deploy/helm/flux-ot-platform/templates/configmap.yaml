@@ -1,0 +1,112 @@
+{{/*
+Flux OT Platform — ConfigMap (Helm-templated)
+Generates the platform-wide non-secret configuration ConfigMap.
+Values can be overridden via .Values.platformApi.config.
+*/}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: configuration
+  {{- with (include "flux-ot-platform.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+data:
+  # ---- Runtime ----
+  ENVIRONMENT: {{ .Values.global.environment | quote }}
+  LOG_LEVEL: {{ .Values.platformApi.config.LOG_LEVEL | default "INFO" | quote }}
+  LOG_FORMAT: {{ .Values.platformApi.config.LOG_FORMAT | default "json" | quote }}
+  DEBUG: {{ .Values.platformApi.config.DEBUG | default "false" | quote }}
+
+  # ---- Kafka ----
+  KAFKA_BOOTSTRAP_SERVERS: {{ .Values.platformApi.config.KAFKA_BOOTSTRAP_SERVERS | default (printf "fluxot-kafka-kafka-bootstrap.fluxot-messaging.svc.cluster.local:9092") | quote }}
+  KAFKA_BOOTSTRAP_SERVERS_TLS: {{ .Values.platformApi.config.KAFKA_BOOTSTRAP_SERVERS_TLS | default "fluxot-kafka-kafka-bootstrap.fluxot-messaging.svc.cluster.local:9093" | quote }}
+  KAFKA_SECURITY_PROTOCOL: {{ .Values.platformApi.config.KAFKA_SECURITY_PROTOCOL | default "SASL_PLAINTEXT" | quote }}
+  KAFKA_SASL_MECHANISM: {{ .Values.platformApi.config.KAFKA_SASL_MECHANISM | default "SCRAM-SHA-512" | quote }}
+  KAFKA_TLS_CA_CERT_PATH: "/etc/kafka/tls/ca.crt"
+  KAFKA_TELEMETRY_CONSUMER_GROUP: "fluxot-api-telemetry-group"
+  KAFKA_ALERTS_CONSUMER_GROUP: "fluxot-api-alerts-group"
+  KAFKA_HEARTBEAT_CONSUMER_GROUP: "fluxot-api-heartbeat-group"
+  KAFKA_WRITEBACK_CONSUMER_GROUP: "fluxot-api-writeback-group"
+  KAFKA_AI_CONSUMER_GROUP: "fluxot-api-ai-group"
+  KAFKA_TOPIC_TELEMETRY: "fluxot-telemetry"
+  KAFKA_TOPIC_ALERTS: "fluxot-alerts"
+  KAFKA_TOPIC_COMMANDS: "fluxot-commands"
+  KAFKA_TOPIC_HEARTBEAT: "fluxot-heartbeat"
+  KAFKA_TOPIC_WRITEBACK: "fluxot-writeback"
+  KAFKA_TOPIC_AI_PREDICTIONS: "fluxot-ai-predictions"
+  KAFKA_TOPIC_DLQ: "fluxot-dlq"
+  KAFKA_PRODUCER_ACKS: "all"
+  KAFKA_PRODUCER_RETRIES: "3"
+  KAFKA_PRODUCER_ENABLE_IDEMPOTENCE: "true"
+  KAFKA_PRODUCER_COMPRESSION: "lz4"
+
+  # ---- MQTT / AMQ Broker ----
+  MQTT_BROKER_HOST: {{ .Values.platformApi.config.MQTT_BROKER_HOST | default "fluxot-amq-broker-hdls-svc.fluxot-messaging.svc.cluster.local" | quote }}
+  MQTT_BROKER_PORT: {{ .Values.platformApi.config.MQTT_BROKER_PORT | default "1883" | quote }}
+  MQTT_BROKER_SSL_PORT: {{ .Values.platformApi.config.MQTT_BROKER_SSL_PORT | default "8883" | quote }}
+  MQTT_BROKER_AMQP_PORT: {{ .Values.platformApi.config.MQTT_BROKER_AMQP_PORT | default "5672" | quote }}
+  MQTT_TLS_ENABLED: {{ .Values.security.tls.enabled | toString | quote }}
+  MQTT_TLS_CA_CERT_PATH: "/etc/mqtt/tls/ca.crt"
+  MQTT_KEEP_ALIVE_SECONDS: "60"
+  MQTT_QOS: "1"
+  MQTT_TOPIC_TELEMETRY_PREFIX: "fluxot/telemetry/"
+  MQTT_TOPIC_COMMANDS_PREFIX: "fluxot/commands/"
+  MQTT_TOPIC_HEARTBEAT_PREFIX: "fluxot/heartbeat/"
+
+  # ---- TimescaleDB ----
+  DB_HOST: {{ include "flux-ot-platform.fullname" . }}-timescaledb.{{ .Release.Namespace }}.svc.cluster.local
+  DB_PORT: "5432"
+  DB_NAME: {{ .Values.timescaledb.database | default "fluxot" | quote }}
+  DB_SSL_MODE: "require"
+  DB_MAX_CONNECTIONS: {{ .Values.platformApi.config.DB_MAX_CONNECTIONS | default "20" | quote }}
+  DB_MIN_CONNECTIONS: {{ .Values.platformApi.config.DB_MIN_CONNECTIONS | default "5" | quote }}
+  DB_CONNECTION_TIMEOUT_SECONDS: "30"
+  DB_COMMAND_TIMEOUT_SECONDS: "60"
+  TIMESCALE_CHUNK_TIME_INTERVAL: "1 day"
+  TIMESCALE_COMPRESS_AFTER: "7 days"
+  TIMESCALE_DROP_AFTER: "365 days"
+
+  # ---- Redis ----
+  REDIS_HOST: {{ include "flux-ot-platform.fullname" . }}-redis-master.{{ .Release.Namespace }}.svc.cluster.local
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  REDIS_MAX_CONNECTIONS: "50"
+  REDIS_CONNECT_TIMEOUT_SECONDS: "5"
+  REDIS_TLS_ENABLED: "false"
+
+  # ---- AI inference service ----
+  AI_SERVICE_URL: {{ .Values.platformApi.config.AI_SERVICE_URL | default "http://fluxot-ai-inference.fluxot-ai.svc.cluster.local:8080" | quote }}
+  AI_SERVICE_TIMEOUT_SECONDS: "30"
+  AI_PREDICTION_ENABLED: {{ .Values.platformApi.config.AI_PREDICTION_ENABLED | default "true" | quote }}
+  AI_ANOMALY_THRESHOLD: {{ .Values.platformApi.config.AI_ANOMALY_THRESHOLD | default "0.85" | quote }}
+  AI_BATCH_SIZE: "100"
+
+  # ---- API server ----
+  API_HOST: "0.0.0.0"
+  API_PORT: {{ .Values.platformApi.service.port | toString | quote }}
+  API_WORKERS: {{ .Values.platformApi.config.API_WORKERS | default "4" | quote }}
+  API_WORKER_CLASS: "uvicorn.workers.UvicornWorker"
+  API_KEEPALIVE: "120"
+  API_GRACEFUL_TIMEOUT: "30"
+  API_MAX_REQUESTS: "10000"
+  API_MAX_REQUESTS_JITTER: "1000"
+  API_CORS_ORIGINS: {{ printf "https://platform-api.%s,https://grafana.%s" .Values.global.clusterDomain .Values.global.clusterDomain | quote }}
+  API_CORS_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
+
+  # ---- Telemetry processing ----
+  TELEMETRY_BATCH_SIZE: "500"
+  TELEMETRY_FLUSH_INTERVAL_SECONDS: "5"
+  ALERT_DEDUP_WINDOW_SECONDS: "60"
+  HEARTBEAT_TIMEOUT_SECONDS: "120"
+  COMMAND_RESPONSE_TIMEOUT_SECONDS: "30"
+
+  # ---- Deployment metadata ----
+  PLATFORM_VERSION: {{ .Chart.AppVersion | quote }}
+  PLATFORM_CLUSTER: {{ .Values.global.clusterDomain | quote }}
+  PLATFORM_RELEASE: {{ .Release.Name | quote }}
