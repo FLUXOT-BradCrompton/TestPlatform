@@ -1,0 +1,139 @@
+# Flux OT — Platform ConfigMap (non-secret configuration)
+# All sensitive values (passwords, keys, connection strings with credentials)
+# must NOT be placed here — use secret-platform.yaml for those.
+#
+# Apply: oc apply -f configmap-platform.yaml -n fluxot-platform
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-platform-config
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/name: platform-config
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: configuration
+    environment: production
+  annotations:
+    fluxot.io/managed-by: "ops"
+    fluxot.io/last-reviewed: "2024-01-01"
+data:
+  # --------------------------------------------------------
+  # Runtime environment
+  # --------------------------------------------------------
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  # Structured JSON logging for log aggregation (ELK/Loki)
+  LOG_FORMAT: "json"
+  DEBUG: "false"
+
+  # --------------------------------------------------------
+  # Kafka — bootstrap servers (no credentials here)
+  # SCRAM credentials are injected via Secret mounts.
+  # --------------------------------------------------------
+  KAFKA_BOOTSTRAP_SERVERS: "fluxot-kafka-kafka-bootstrap.fluxot-messaging.svc.cluster.local:9092"
+  KAFKA_BOOTSTRAP_SERVERS_TLS: "fluxot-kafka-kafka-bootstrap.fluxot-messaging.svc.cluster.local:9093"
+  KAFKA_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+  KAFKA_SASL_MECHANISM: "SCRAM-SHA-512"
+  KAFKA_TLS_CA_CERT_PATH: "/etc/kafka/tls/ca.crt"
+  # Consumer group IDs — keep consistent to allow offset management
+  KAFKA_TELEMETRY_CONSUMER_GROUP: "fluxot-api-telemetry-group"
+  KAFKA_ALERTS_CONSUMER_GROUP: "fluxot-api-alerts-group"
+  KAFKA_HEARTBEAT_CONSUMER_GROUP: "fluxot-api-heartbeat-group"
+  KAFKA_WRITEBACK_CONSUMER_GROUP: "fluxot-api-writeback-group"
+  KAFKA_AI_CONSUMER_GROUP: "fluxot-api-ai-group"
+  # Topic names
+  KAFKA_TOPIC_TELEMETRY: "fluxot-telemetry"
+  KAFKA_TOPIC_ALERTS: "fluxot-alerts"
+  KAFKA_TOPIC_COMMANDS: "fluxot-commands"
+  KAFKA_TOPIC_HEARTBEAT: "fluxot-heartbeat"
+  KAFKA_TOPIC_WRITEBACK: "fluxot-writeback"
+  KAFKA_TOPIC_AI_PREDICTIONS: "fluxot-ai-predictions"
+  KAFKA_TOPIC_DLQ: "fluxot-dlq"
+  # Producer settings
+  KAFKA_PRODUCER_ACKS: "all"
+  KAFKA_PRODUCER_RETRIES: "3"
+  KAFKA_PRODUCER_ENABLE_IDEMPOTENCE: "true"
+  KAFKA_PRODUCER_COMPRESSION: "lz4"
+
+  # --------------------------------------------------------
+  # MQTT / AMQ Broker
+  # --------------------------------------------------------
+  MQTT_BROKER_HOST: "fluxot-amq-broker-hdls-svc.fluxot-messaging.svc.cluster.local"
+  MQTT_BROKER_PORT: "1883"
+  MQTT_BROKER_SSL_PORT: "8883"
+  MQTT_BROKER_AMQP_PORT: "5672"
+  MQTT_TLS_ENABLED: "true"
+  MQTT_TLS_CA_CERT_PATH: "/etc/mqtt/tls/ca.crt"
+  MQTT_KEEP_ALIVE_SECONDS: "60"
+  MQTT_QOS: "1"
+  # Topic prefix mapping
+  MQTT_TOPIC_TELEMETRY_PREFIX: "fluxot/telemetry/"
+  MQTT_TOPIC_COMMANDS_PREFIX: "fluxot/commands/"
+  MQTT_TOPIC_HEARTBEAT_PREFIX: "fluxot/heartbeat/"
+
+  # --------------------------------------------------------
+  # TimescaleDB (PostgreSQL)
+  # --------------------------------------------------------
+  DB_HOST: "fluxot-timescaledb.fluxot-platform.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "fluxot"
+  DB_SSL_MODE: "require"
+  DB_MAX_CONNECTIONS: "20"
+  DB_MIN_CONNECTIONS: "5"
+  DB_CONNECTION_TIMEOUT_SECONDS: "30"
+  DB_COMMAND_TIMEOUT_SECONDS: "60"
+  # TimescaleDB chunk time interval for telemetry hypertable
+  TIMESCALE_CHUNK_TIME_INTERVAL: "1 day"
+  TIMESCALE_COMPRESS_AFTER: "7 days"
+  TIMESCALE_DROP_AFTER: "365 days"
+
+  # --------------------------------------------------------
+  # Redis (session cache, rate limiting, pub/sub)
+  # --------------------------------------------------------
+  REDIS_HOST: "fluxot-redis-master.fluxot-platform.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  REDIS_MAX_CONNECTIONS: "50"
+  REDIS_CONNECT_TIMEOUT_SECONDS: "5"
+  REDIS_TLS_ENABLED: "false"
+
+  # --------------------------------------------------------
+  # AI/ML inference service
+  # --------------------------------------------------------
+  AI_SERVICE_URL: "http://fluxot-ai-inference.fluxot-ai.svc.cluster.local:8080"
+  AI_SERVICE_TIMEOUT_SECONDS: "30"
+  AI_PREDICTION_ENABLED: "true"
+  AI_ANOMALY_THRESHOLD: "0.85"
+  AI_BATCH_SIZE: "100"
+
+  # --------------------------------------------------------
+  # API server settings
+  # --------------------------------------------------------
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  API_WORKERS: "4"
+  API_WORKER_CLASS: "uvicorn.workers.UvicornWorker"
+  API_KEEPALIVE: "120"
+  API_GRACEFUL_TIMEOUT: "30"
+  API_MAX_REQUESTS: "10000"
+  API_MAX_REQUESTS_JITTER: "1000"
+  # CORS — restrict to known origins in production
+  API_CORS_ORIGINS: "https://platform-api.apps.ocp4.fluxot.internal,https://grafana.apps.ocp4.fluxot.internal"
+  API_CORS_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
+
+  # --------------------------------------------------------
+  # Telemetry processing
+  # --------------------------------------------------------
+  TELEMETRY_BATCH_SIZE: "500"
+  TELEMETRY_FLUSH_INTERVAL_SECONDS: "5"
+  ALERT_DEDUP_WINDOW_SECONDS: "60"
+  HEARTBEAT_TIMEOUT_SECONDS: "120"
+  COMMAND_RESPONSE_TIMEOUT_SECONDS: "30"
+
+  # --------------------------------------------------------
+  # Site / deployment metadata
+  # --------------------------------------------------------
+  PLATFORM_VERSION: "1.0.0"
+  PLATFORM_REGION: "ap-southeast-2"
+  PLATFORM_CLUSTER: "ocp4.fluxot.internal"

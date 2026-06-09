@@ -1,0 +1,281 @@
+# Flux OT — AMQ Broker (ActiveMQ Artemis) for MQTT Gateway
+# HA pair with 2 replicas, persistent journal storage.
+# Accepts MQTT (1883), MQTT-over-TLS (8883), AMQP (5672), and the
+# Artemis management console (8161).
+#
+# Prerequisites: AMQ Broker Operator installed in fluxot-messaging namespace
+# TLS Secret: fluxot-amq-tls must exist with tls.crt, tls.key, and ca.crt keys
+#   Create via: oc create secret tls fluxot-amq-tls --cert=broker.crt --key=broker.key
+#
+# Apply: oc apply -f amq-broker.yaml -n fluxot-messaging
+---
+apiVersion: broker.amq.io/v1beta1
+kind: ActiveMQArtemis
+metadata:
+  name: fluxot-amq-broker
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/name: amq-broker
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: mqtt-broker
+    environment: production
+spec:
+  # HA via 2 replicas — AMQ Broker uses shared-nothing live/backup pairs
+  deploymentPlan:
+    size: 2
+    image: placeholder   # Operator resolves correct image from its bundle
+    requireLogin: true
+    persistenceEnabled: true
+    journalType: nio
+    messageMigration: true    # Migrate messages from stopped broker to live node
+
+    # Storage for Artemis message journal
+    storage:
+      size: 5Gi
+      storageClassName: gp3-csi
+
+    # Resource limits — edge-aware sizing for broker pods
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+
+    # Spread HA pair across different nodes
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+                - key: ActiveMQArtemis
+                  operator: In
+                  values:
+                    - fluxot-amq-broker
+            topologyKey: kubernetes.io/hostname
+
+    podSecurityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+
+    livenessProbe:
+      exec:
+        command:
+          - /bin/bash
+          - -c
+          - |
+            /opt/amq/bin/artemis check queue \
+              --name health-check \
+              --url tcp://localhost:61616 \
+              --user $AMQ_USER \
+              --password $AMQ_PASSWORD \
+              --silent || curl -sf http://localhost:8161/console/jolokia/read/org.apache.activemq.artemis:broker=*,component=addresses,address=*,subcomponent=queues,routing-type=anycast,queue=*%2Fhealth-check/MessageCount > /dev/null
+      initialDelaySeconds: 30
+      periodSeconds: 30
+      timeoutSeconds: 10
+      failureThreshold: 3
+
+    readinessProbe:
+      tcpSocket:
+        port: 61616
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      timeoutSeconds: 5
+
+  # --------------------------------------------------------
+  # Acceptors — one per protocol
+  # --------------------------------------------------------
+  acceptors:
+    # Plain MQTT — IoT devices without TLS (internal cluster only, not exposed)
+    - name: mqtt
+      port: 1883
+      protocols: mqtt
+      expose: false    # Do NOT expose plain MQTT externally
+      sslEnabled: false
+      anycastPrefix: jms.queue.
+      multicastPrefix: /topic/
+
+    # MQTT over TLS — primary endpoint for IoT devices
+    - name: mqtt-ssl
+      port: 8883
+      protocols: mqtt
+      expose: true
+      sslEnabled: true
+      sslSecret: fluxot-amq-tls
+      enabledProtocols: TLSv1.2,TLSv1.3
+      needClientAuth: false         # MQTT uses password auth, not mTLS
+      verifyHost: false
+      anycastPrefix: jms.queue.
+      multicastPrefix: /topic/
+
+    # AMQP — for internal service-to-service messaging (Camel K, etc.)
+    - name: amqp
+      port: 5672
+      protocols: amqp
+      expose: false
+      sslEnabled: false
+
+    # All-protocols listener for internal management
+    - name: all-internal
+      port: 61616
+      protocols: core,openwire,amqp,hornetq,mqtt,stomp
+      expose: false
+      sslEnabled: false
+
+  # --------------------------------------------------------
+  # Connectors (outbound) — none required for inbound MQTT gateway role
+  # --------------------------------------------------------
+  connectors: []
+
+  # --------------------------------------------------------
+  # Console (Hawtio management UI) — exposed via OpenShift Route
+  # --------------------------------------------------------
+  console:
+    expose: true
+    sslEnabled: true
+    sslSecret: fluxot-amq-tls
+
+  # --------------------------------------------------------
+  # Broker configuration properties
+  # --------------------------------------------------------
+  brokerProperties:
+    # Journal settings for durability
+    - "journalMinFiles=10"
+    - "journalPoolFiles=10"
+    - "journalFileSize=10485760"       # 10 MiB journal files
+    # Large message threshold
+    - "largeMessageSize=104857600"     # 100 MiB
+    # Connection limits
+    - "globalMaxSize=536870912"        # 512 MiB global message store limit
+    # MQTT-specific: allow retained messages
+    - "mqttSubscriptionBypassSecurity=false"
+    # Dead-letter and expiry
+    - "defaultDeadLetterAddress=DLQ"
+    - "defaultExpiryAddress=ExpiryQueue"
+
+  # --------------------------------------------------------
+  # Address settings for MQTT topic hierarchy
+  # --------------------------------------------------------
+  addressSettings:
+    applyRule: replace_all
+    addressSetting:
+      # Telemetry topics — high throughput, paged to disk to bound memory
+      - match: "fluxot.telemetry.#"
+        maxSizeBytes: 104857600        # 100 MiB per address
+        pageSizeBytes: 10485760        # 10 MiB page size
+        pageMaxCacheSize: 5
+        messageCounterHistoryDayLimit: 7
+        defaultLastValueQueue: false
+        redistributionDelay: 1000
+        sendToDLAOnNoRoute: true
+        deadLetterAddress: DLQ
+        expiryAddress: ExpiryQueue
+        autoCreateQueues: true
+        autoCreateAddresses: true
+
+      # Command topics — persistent, no paging, highest priority
+      - match: "fluxot.commands.#"
+        maxSizeBytes: 10485760         # 10 MiB
+        messagePriority: 9
+        redistributionDelay: 0
+        deadLetterAddress: DLQ
+        autoCreateQueues: true
+        autoCreateAddresses: true
+
+      # Heartbeat — short TTL, auto-expire
+      - match: "fluxot.heartbeat.#"
+        defaultMessageTtl: 60000       # 60 second TTL
+        maxSizeBytes: 10485760
+        autoCreateQueues: true
+        autoCreateAddresses: true
+
+      # Default catch-all
+      - match: "#"
+        deadLetterAddress: DLQ
+        expiryAddress: ExpiryQueue
+        autoCreateQueues: true
+        autoCreateAddresses: true
+        sendToDLAOnNoRoute: true
+
+  # --------------------------------------------------------
+  # Admin credentials secret reference
+  # Secret must contain: AMQ_USER, AMQ_PASSWORD, AMQ_CLUSTER_USER, AMQ_CLUSTER_PASSWORD
+  # Create via: oc create secret generic fluxot-amq-credentials \
+  #   --from-literal=AMQ_USER=admin --from-literal=AMQ_PASSWORD=<password>
+  # --------------------------------------------------------
+  adminUser: ""     # Read from secret below
+  adminPassword: "" # Read from secret below
+
+  # Environment variables injected into broker pods
+  env:
+    - name: AMQ_USER
+      valueFrom:
+        secretKeyRef:
+          name: fluxot-amq-credentials
+          key: AMQ_USER
+    - name: AMQ_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: fluxot-amq-credentials
+          key: AMQ_PASSWORD
+    - name: AMQ_CLUSTER_USER
+      valueFrom:
+        secretKeyRef:
+          name: fluxot-amq-credentials
+          key: AMQ_CLUSTER_USER
+    - name: AMQ_CLUSTER_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: fluxot-amq-credentials
+          key: AMQ_CLUSTER_PASSWORD
+    # JVM heap — leave room for off-heap journal buffers
+    - name: AMQ_JVM_OPTS
+      value: "-Xms512m -Xmx800m -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+---
+# ============================================================
+# ActiveMQArtemisAddress — pre-create the core IoT addresses
+# so they are available before any device connects.
+# ============================================================
+apiVersion: broker.amq.io/v1beta1
+kind: ActiveMQArtemisAddress
+metadata:
+  name: fluxot-telemetry-address
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  addressName: fluxot.telemetry
+  queueName: fluxot.telemetry
+  routingType: multicast   # Fan-out to multiple consumers (bridge, logging, etc.)
+  removeFromBrokerOnDelete: false
+---
+apiVersion: broker.amq.io/v1beta1
+kind: ActiveMQArtemisAddress
+metadata:
+  name: fluxot-commands-address
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  addressName: fluxot.commands
+  queueName: fluxot.commands
+  routingType: anycast     # Point-to-point delivery to target device
+  removeFromBrokerOnDelete: false
+---
+apiVersion: broker.amq.io/v1beta1
+kind: ActiveMQArtemisAddress
+metadata:
+  name: fluxot-heartbeat-address
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  addressName: fluxot.heartbeat
+  queueName: fluxot.heartbeat
+  routingType: multicast
+  removeFromBrokerOnDelete: false

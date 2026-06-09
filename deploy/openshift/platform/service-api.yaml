@@ -1,0 +1,125 @@
+# Flux OT — Platform API Service and OpenShift Route
+# ClusterIP Service on port 8000.
+# Route with TLS edge termination — HTTPS terminates at the OpenShift router;
+# traffic to the pod is plain HTTP (acceptable inside the cluster trust boundary).
+# insecureEdgeTerminationPolicy: Redirect forces HTTP→HTTPS at the ingress level.
+#
+# Apply: oc apply -f service-api.yaml -n fluxot-platform
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxot-platform-api-svc
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-platform-api
+    app.kubernetes.io/name: platform-api
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: api
+    environment: production
+  annotations:
+    # Allow Prometheus ServiceMonitor to discover this service
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app: fluxot-platform-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+  # Session affinity NONE — API is stateless; requests can go to any replica
+  sessionAffinity: None
+---
+# ============================================================
+# OpenShift Route — HTTPS edge termination
+# Replace {cluster-domain} with your actual OpenShift base domain.
+# Example: apps.ocp4.fluxot.internal
+#
+# To discover your cluster domain:
+#   oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'
+# ============================================================
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: fluxot-platform-api
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-platform-api
+    app.kubernetes.io/name: platform-api
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: api
+    environment: production
+  annotations:
+    # Increase timeout for long-running industrial queries (e.g., historical telemetry export)
+    haproxy.router.openshift.io/timeout: 120s
+    # Enable rate limiting if running HAProxy Router with rate-limit plugin
+    # haproxy.router.openshift.io/rate-limit-connections: "true"
+    # haproxy.router.openshift.io/rate-limit-connections.rate-http: "200"
+    # Enable sticky sessions if needed (API is stateless — not required)
+    # haproxy.router.openshift.io/balance: roundrobin
+spec:
+  # Replace with your actual cluster domain
+  host: platform-api.apps.ocp4.fluxot.internal
+  path: /
+  to:
+    kind: Service
+    name: fluxot-platform-api-svc
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    # Edge termination: TLS ends at the router, plain HTTP to backend pod
+    termination: edge
+    # Redirect all plain HTTP to HTTPS — important for security compliance
+    insecureEdgeTerminationPolicy: Redirect
+    # In production: supply your CA-signed certificate
+    # certificate: |
+    #   -----BEGIN CERTIFICATE-----
+    #   <router certificate PEM>
+    #   -----END CERTIFICATE-----
+    # key: |
+    #   -----BEGIN RSA PRIVATE KEY-----
+    #   <router key PEM>
+    #   -----END RSA PRIVATE KEY-----
+    # caCertificate: |
+    #   -----BEGIN CERTIFICATE-----
+    #   <CA PEM>
+    #   -----END CERTIFICATE-----
+  wildcardPolicy: None
+---
+# ============================================================
+# Internal service for the MQTT bridge (no external route needed)
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxot-mqtt-bridge-svc
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-mqtt-bridge
+    app.kubernetes.io/name: mqtt-bridge
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: bridge
+    environment: production
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app: fluxot-mqtt-bridge
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
+  sessionAffinity: None

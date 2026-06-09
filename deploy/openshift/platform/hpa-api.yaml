@@ -1,0 +1,97 @@
+# Flux OT — HorizontalPodAutoscaler for Platform API
+# Scales between 3 and 10 replicas based on CPU (70%) and memory (80%) utilisation.
+#
+# Scale-down stabilisation window is 5 minutes (300s) — critical for industrial
+# workloads where load can spike briefly during telemetry bursts; premature
+# scale-down would cause latency spikes as new pods warm up.
+#
+# Prerequisites: metrics-server must be running (installed by default on OpenShift).
+# For custom metrics (e.g., Kafka consumer lag → HPA), deploy the
+# Prometheus Adapter and add an external/custom metric source here.
+#
+# Apply: oc apply -f hpa-api.yaml -n fluxot-platform
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fluxot-platform-api-hpa
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/name: platform-api-hpa
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: api
+    environment: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fluxot-platform-api
+
+  minReplicas: 3    # Never scale below 3 — required for HA (PDB minAvailable: 2)
+  maxReplicas: 10   # 10 × 1 CPU / 1 GiB = 10 CPU / 10 GiB max API footprint
+
+  metrics:
+    # ---- CPU utilisation ----
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Scale out when average CPU across pods exceeds 70%
+          # Headroom prevents latency spikes before new pods are ready
+          averageUtilization: 70
+
+    # ---- Memory utilisation ----
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          # Scale out when average memory across pods exceeds 80%
+          # Leave 20% headroom for GC pauses and request bursts
+          averageUtilization: 80
+
+    # ---- Optional: Kafka consumer lag (requires Prometheus Adapter) ----
+    # Uncomment and install prometheus-adapter to enable lag-based scaling.
+    # - type: External
+    #   external:
+    #     metric:
+    #       name: kafka_consumergroup_lag
+    #       selector:
+    #         matchLabels:
+    #           consumergroup: "fluxot-api-telemetry-group"
+    #           topic: "fluxot-telemetry"
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "5000"    # Scale out if average lag per pod > 5000 messages
+
+  behavior:
+    scaleDown:
+      # 5-minute stabilisation window prevents thrashing after short telemetry bursts
+      # Industrial loads often spike for 30-60 seconds; this window absorbs that.
+      stabilizationWindowSeconds: 300
+      policies:
+        # Allow removing at most 1 pod every 60 seconds during scale-down
+        # This prevents a sudden drop in capacity if load briefly subsides
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+        # Alternatively: never remove more than 25% of current replicas per period
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min    # Use the more conservative of the two policies
+
+    scaleUp:
+      # Aggressive scale-out: no stabilisation window — react immediately to load
+      stabilizationWindowSeconds: 0
+      policies:
+        # Allow adding up to 2 pods per 30 seconds
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+        # Or 50% of current replicas per 30 seconds (for large-scale burst)
+        - type: Percent
+          value: 50
+          periodSeconds: 30
+      selectPolicy: Max    # Use the more aggressive of the two policies

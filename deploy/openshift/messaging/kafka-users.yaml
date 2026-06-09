@@ -1,0 +1,276 @@
+# Flux OT — Kafka User Definitions (SCRAM-SHA-512 authentication + ACLs)
+# The Entity Operator creates Kubernetes Secrets with the generated credentials.
+# Secret name pattern: <username>  (e.g., Secret/fluxot-api-user in fluxot-messaging)
+#
+# ACL operations reference:
+#   Read/Write on Topic: consumer/producer group membership
+#   Describe on Topic: required for both read and write
+#   Read on Group:  allows consumer group management
+#
+# Apply: oc apply -f kafka-users.yaml -n fluxot-messaging
+---
+# ============================================================
+# fluxot-api-user
+# Platform API service: produces sensor commands and writeback,
+# consumes telemetry/alerts/heartbeat/writeback.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: fluxot-api-user
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: api
+    environment: production
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # --- Producer: telemetry ingestion gateway ---
+      - resource:
+          type: topic
+          name: fluxot-telemetry
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Producer: command dispatch ---
+      - resource:
+          type: topic
+          name: fluxot-commands
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Producer: state writeback ---
+      - resource:
+          type: topic
+          name: fluxot-writeback
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Consumer: telemetry processing ---
+      - resource:
+          type: topic
+          name: fluxot-telemetry
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-api-telemetry-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Consumer: alerts ---
+      - resource:
+          type: topic
+          name: fluxot-alerts
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-api-alerts-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Consumer: heartbeat monitoring ---
+      - resource:
+          type: topic
+          name: fluxot-heartbeat
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-api-heartbeat-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Consumer: writeback acknowledgements ---
+      - resource:
+          type: topic
+          name: fluxot-writeback
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-api-writeback-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Consumer: AI predictions (to surface in API responses) ---
+      - resource:
+          type: topic
+          name: fluxot-ai-predictions
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-api-ai-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Producer: DLQ for failed processing ---
+      - resource:
+          type: topic
+          name: fluxot-dlq
+          patternType: literal
+        operations: [Write, Describe]
+        host: "*"
+  # Quota — prevent a misbehaving API from saturating the cluster
+  quotas:
+    producerByteRate: 10485760    # 10 MiB/s produce
+    consumerByteRate: 20971520    # 20 MiB/s consume
+    requestPercentage: 25
+---
+# ============================================================
+# fluxot-bridge-user
+# MQTT-Kafka bridge service: forwards MQTT device messages to Kafka
+# and delivers Kafka commands back to MQTT devices.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: fluxot-bridge-user
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: bridge
+    environment: production
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # --- Producer: forwards device telemetry from MQTT to Kafka ---
+      - resource:
+          type: topic
+          name: fluxot-telemetry
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Producer: forwards device alerts from MQTT to Kafka ---
+      - resource:
+          type: topic
+          name: fluxot-alerts
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Producer: heartbeat forwarding ---
+      - resource:
+          type: topic
+          name: fluxot-heartbeat
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Consumer: commands (push to MQTT devices) ---
+      - resource:
+          type: topic
+          name: fluxot-commands
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-bridge-commands-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Consumer: writeback to devices ---
+      - resource:
+          type: topic
+          name: fluxot-writeback
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-bridge-writeback-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Producer: dead-letter for failed MQTT→Kafka conversions ---
+      - resource:
+          type: topic
+          name: fluxot-dlq
+          patternType: literal
+        operations: [Write, Describe]
+        host: "*"
+  quotas:
+    producerByteRate: 20971520    # 20 MiB/s — bridge is the primary ingest path
+    consumerByteRate: 10485760    # 10 MiB/s
+    requestPercentage: 30
+---
+# ============================================================
+# fluxot-ai-user
+# AI inference service: consumes telemetry/alerts for model input,
+# produces predictions back to Kafka.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: fluxot-ai-user
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ai-inference
+    environment: production
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # --- Consumer: telemetry for model inference ---
+      - resource:
+          type: topic
+          name: fluxot-telemetry
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-ai-telemetry-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Consumer: alerts for anomaly context ---
+      - resource:
+          type: topic
+          name: fluxot-alerts
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: fluxot-ai-alerts-group
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # --- Producer: publish inference results ---
+      - resource:
+          type: topic
+          name: fluxot-ai-predictions
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      # --- Producer: DLQ for failed inference ---
+      - resource:
+          type: topic
+          name: fluxot-dlq
+          patternType: literal
+        operations: [Write, Describe]
+        host: "*"
+  quotas:
+    producerByteRate: 5242880     # 5 MiB/s — predictions are relatively infrequent
+    consumerByteRate: 20971520    # 20 MiB/s — needs high read throughput for batch inference
+    requestPercentage: 20
