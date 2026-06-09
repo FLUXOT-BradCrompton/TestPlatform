@@ -1,0 +1,306 @@
+# Flux OT Platform — OpenShift Namespace Definitions
+# Creates the four core namespaces with ResourceQuota and LimitRange
+# Apply order: this file first, then operators, then workloads.
+---
+# ============================================================
+# Namespace: fluxot-platform  (core API, integration, data)
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/managed-by: flux-ot-ops
+    environment: production
+    # OpenShift Pod Security Admission — restricted profile
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+  annotations:
+    openshift.io/description: "Flux OT core platform services — API, integration engine, TimescaleDB"
+    openshift.io/display-name: "Flux OT Platform"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fluxot-platform-quota
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  hard:
+    # Compute — sized for 3 API replicas + bridge + TimescaleDB
+    requests.cpu: "12"
+    requests.memory: "24Gi"
+    limits.cpu: "24"
+    limits.memory: "48Gi"
+    # Storage
+    requests.storage: "2Ti"
+    persistentvolumeclaims: "20"
+    # Object counts
+    count/pods: "50"
+    count/services: "20"
+    count/configmaps: "30"
+    count/secrets: "30"
+    count/deployments.apps: "20"
+    count/statefulsets.apps: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fluxot-platform-limits
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu: "100m"
+        memory: "128Mi"
+      max:
+        cpu: "4"
+        memory: "8Gi"
+      min:
+        cpu: "50m"
+        memory: "64Mi"
+    - type: Pod
+      max:
+        cpu: "8"
+        memory: "16Gi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "1Ti"
+      min:
+        storage: "1Gi"
+---
+# ============================================================
+# Namespace: fluxot-messaging  (AMQ Streams Kafka + AMQ Broker)
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/managed-by: flux-ot-ops
+    environment: production
+    # Kafka pods use JMX and need slightly elevated privileges — use baseline
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/audit: restricted
+  annotations:
+    openshift.io/description: "Flux OT messaging layer — AMQ Streams Kafka cluster and AMQ Broker MQTT gateway"
+    openshift.io/display-name: "Flux OT Messaging"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fluxot-messaging-quota
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  hard:
+    # Compute — 3 brokers (2CPU/4Gi each) + 3 ZK (500m/1Gi each) + 2 AMQ broker replicas
+    requests.cpu: "16"
+    requests.memory: "32Gi"
+    limits.cpu: "32"
+    limits.memory: "64Gi"
+    # Storage — 100Gi per broker × 3 + ZK + AMQ journals
+    requests.storage: "1Ti"
+    persistentvolumeclaims: "30"
+    count/pods: "40"
+    count/services: "20"
+    count/configmaps: "20"
+    count/secrets: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fluxot-messaging-limits
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: "2Gi"
+      defaultRequest:
+        cpu: "500m"
+        memory: "1Gi"
+      max:
+        cpu: "4"
+        memory: "8Gi"
+      min:
+        cpu: "100m"
+        memory: "256Mi"
+    - type: Pod
+      max:
+        cpu: "8"
+        memory: "16Gi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "500Gi"
+      min:
+        storage: "5Gi"
+---
+# ============================================================
+# Namespace: fluxot-ai  (AI/ML inference services)
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/managed-by: flux-ot-ops
+    environment: production
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+  annotations:
+    openshift.io/description: "Flux OT AI/ML inference services — anomaly detection, predictive maintenance"
+    openshift.io/display-name: "Flux OT AI"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fluxot-ai-quota
+  namespace: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  hard:
+    # AI inference is CPU/GPU intensive — allow burst headroom
+    requests.cpu: "16"
+    requests.memory: "32Gi"
+    limits.cpu: "32"
+    limits.memory: "64Gi"
+    requests.storage: "500Gi"
+    persistentvolumeclaims: "20"
+    count/pods: "30"
+    count/services: "15"
+    count/configmaps: "20"
+    count/secrets: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fluxot-ai-limits
+  namespace: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: "2Gi"
+      defaultRequest:
+        cpu: "500m"
+        memory: "1Gi"
+      max:
+        cpu: "8"
+        memory: "16Gi"
+      min:
+        cpu: "100m"
+        memory: "128Mi"
+    - type: Pod
+      max:
+        cpu: "16"
+        memory: "32Gi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "200Gi"
+      min:
+        storage: "1Gi"
+---
+# ============================================================
+# Namespace: fluxot-monitoring  (Prometheus, Grafana, Alertmanager)
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/managed-by: flux-ot-ops
+    environment: production
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+  annotations:
+    openshift.io/description: "Flux OT observability stack — Prometheus, Grafana, Alertmanager"
+    openshift.io/display-name: "Flux OT Monitoring"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fluxot-monitoring-quota
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: "16Gi"
+    limits.cpu: "16"
+    limits.memory: "32Gi"
+    # Prometheus TSDB — generous storage for 90-day retention
+    requests.storage: "1Ti"
+    persistentvolumeclaims: "20"
+    count/pods: "30"
+    count/services: "20"
+    count/configmaps: "30"
+    count/secrets: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fluxot-monitoring-limits
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "1Gi"
+      defaultRequest:
+        cpu: "200m"
+        memory: "256Mi"
+      max:
+        cpu: "4"
+        memory: "8Gi"
+      min:
+        cpu: "50m"
+        memory: "64Mi"
+    - type: Pod
+      max:
+        cpu: "8"
+        memory: "16Gi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "500Gi"
+      min:
+        storage: "1Gi"

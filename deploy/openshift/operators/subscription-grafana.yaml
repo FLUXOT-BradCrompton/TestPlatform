@@ -1,0 +1,51 @@
+# Flux OT — Grafana Operator Subscription (Community)
+# Grafana Community Operator provides the Grafana, GrafanaDataSource, and
+# GrafanaDashboard CRDs used by the monitoring stack.
+#
+# Note: The community operator is not supported by Red Hat. For certified
+# alternatives, evaluate the Red Hat Observability Operator or Grafana Enterprise.
+#
+# Apply: oc apply -f subscription-grafana.yaml
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: OperatorGroup
+metadata:
+  name: grafana-operatorgroup
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+spec:
+  targetNamespaces:
+    - fluxot-monitoring
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: grafana-operator
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+spec:
+  # v5 channel supports Grafana v10+
+  channel: v5
+  installPlanApproval: Automatic
+  source: community-operators
+  sourceNamespace: openshift-marketplace
+  name: grafana-operator
+  # startingCSV: grafana-operator.v5.13.0
+  config:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+    # Grant the operator access to cluster monitoring metrics
+    env:
+      - name: WATCH_NAMESPACE
+        value: fluxot-monitoring

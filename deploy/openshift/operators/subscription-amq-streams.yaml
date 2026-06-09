@@ -1,0 +1,61 @@
+# Flux OT — AMQ Streams (Kafka) Operator Subscription
+# Red Hat AMQ Streams is the supported Kafka distribution for OpenShift.
+# Installs into the openshift-operators namespace so it is cluster-scoped
+# and can manage Kafka CRDs across all project namespaces.
+#
+# Prerequisites:
+#   - OpenShift 4.x with OperatorHub access to redhat-operators catalog
+#   - Cluster-admin role
+#
+# Apply: oc apply -f subscription-amq-streams.yaml
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: OperatorGroup
+metadata:
+  name: amq-streams-operatorgroup
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: messaging
+    environment: production
+spec:
+  # targetNamespaces left empty = AllNamespaces mode; specify to scope to a single namespace
+  targetNamespaces:
+    - fluxot-messaging
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: amq-streams
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: messaging
+    environment: production
+  annotations:
+    # Pin to a specific starting CSV in production; update intentionally via installPlanApproval: Manual
+    # operators.coreos.com/amqstreams.fluxot-messaging: ""
+spec:
+  # Red Hat supported channel — tracks the latest stable AMQ Streams release
+  channel: stable
+  installPlanApproval: Automatic
+  # Source must match the CatalogSource name in openshift-marketplace
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  name: amq-streams
+  # Optionally pin to a specific CSV version; leave blank for latest in channel
+  # startingCSV: amqstreams.v2.7.0-2
+  config:
+    # Operator-level resource overrides (applied to the operator manager pod)
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    # Tolerate dedicated infra nodes if present
+    # tolerations:
+    #   - key: node-role.kubernetes.io/infra
+    #     operator: Exists
+    #     effect: NoSchedule
