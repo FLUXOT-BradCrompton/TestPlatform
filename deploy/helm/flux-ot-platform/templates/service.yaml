@@ -1,0 +1,144 @@
+{{/*
+Flux OT Platform — Services and OpenShift Routes (Helm-templated)
+*/}}
+
+{{/*
+Platform API — ClusterIP Service
+*/}}
+{{- if .Values.platformApi.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-api-svc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  annotations:
+    {{- toYaml .Values.platformApi.service.annotations | nindent 4 }}
+spec:
+  type: {{ .Values.platformApi.service.type }}
+  selector:
+    {{- include "flux-ot-platform.api.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.platformApi.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.platformApi.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+  sessionAffinity: None
+{{- end }}
+
+{{/*
+Platform API — OpenShift Route
+*/}}
+{{- if and .Values.platformApi.enabled .Values.platformApi.route.enabled }}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  annotations:
+    {{- toYaml .Values.platformApi.route.annotations | nindent 4 }}
+spec:
+  host: {{ include "flux-ot-platform.routeHostname" (dict "hostname" .Values.platformApi.route.hostname "prefix" "platform-api" "global" .Values.global) }}
+  path: /
+  to:
+    kind: Service
+    name: {{ include "flux-ot-platform.fullname" . }}-api-svc
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: {{ .Values.platformApi.route.tls.termination | default "edge" }}
+    insecureEdgeTerminationPolicy: {{ .Values.platformApi.route.tls.insecureEdgeTerminationPolicy | default "Redirect" }}
+  wildcardPolicy: None
+{{- end }}
+
+{{/*
+MQTT Bridge — ClusterIP Service (health + metrics, no external exposure)
+*/}}
+{{- if .Values.mqttBridge.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-bridge-svc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bridge
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "flux-ot-platform.bridge.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
+  sessionAffinity: None
+{{- end }}
+
+{{/*
+TimescaleDB — ClusterIP Service
+*/}}
+{{- if .Values.timescaledb.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-timescaledb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9187"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "flux-ot-platform.timescaledb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+    - name: metrics
+      port: 9187
+      targetPort: metrics
+      protocol: TCP
+  sessionAffinity: None
+---
+# Headless service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-timescaledb-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "flux-ot-platform.timescaledb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+{{- end }}

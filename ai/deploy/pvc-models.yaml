@@ -1,0 +1,89 @@
+# ===========================================================================
+# Flux OT — Persistent Volume Claims for AI Model Storage
+#
+# Namespace : fluxot-ai
+# Purpose   : Shared model artifact storage for belt rip + road crossing
+#             inference pods.  Both deployment replicas mount this PVC
+#             read-only after the init container writes models on first boot.
+#
+# Apply: oc apply -f pvc-models.yaml
+# ===========================================================================
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fluxot-ai-models-pvc
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-ai-inference
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ai-model-storage
+    environment: production
+  annotations:
+    openshift.io/description: "Shared PVC for ML model artifacts — belt rip and road crossing models"
+    # Annotation used by automated backup jobs (Velero)
+    backup.velero.io/backup-volumes: "fluxot-ai-models-pvc"
+spec:
+  accessModes:
+    # ReadWriteOnce: adequate for single-node writes by init container;
+    # inference replicas mount read-only (enforced by init container coordination).
+    # Upgrade to ReadWriteMany (RWX) if using a shared filesystem StorageClass
+    # such as OpenShift Data Foundation CephFS.
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # Specify your StorageClass name — must support RWO minimum.
+  # OpenShift default:       "gp3-csi"  (AWS) / "thin-csi" (vSphere) / "standard" (GKE)
+  # OpenShift Data Foundation: "ocs-storagecluster-cephfs" (for RWX)
+  storageClassName: gp3-csi
+  volumeMode: Filesystem
+---
+# ---------------------------------------------------------------------------
+# Optional: ReadWriteMany PVC using CephFS for multi-replica concurrent access
+# Uncomment and use instead of the above if ODF is available.
+# ---------------------------------------------------------------------------
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: fluxot-ai-models-pvc
+#   namespace: fluxot-ai
+#   labels:
+#     app: fluxot-ai-inference
+#     app.kubernetes.io/part-of: fluxot-platform
+#     app.kubernetes.io/component: ai-model-storage
+#     environment: production
+# spec:
+#   accessModes:
+#     - ReadWriteMany
+#   resources:
+#     requests:
+#       storage: 10Gi
+#   storageClassName: ocs-storagecluster-cephfs
+#   volumeMode: Filesystem
+---
+# ---------------------------------------------------------------------------
+# MLflow PostgreSQL data PVC (if using the bundled StatefulSet)
+# Defined here for centralised storage management.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fluxot-mlflow-postgres-pvc
+  namespace: fluxot-ai
+  labels:
+    app: mlflow-postgres
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ml-tracking-db
+    environment: production
+  annotations:
+    openshift.io/description: "PostgreSQL data volume for MLflow backend store"
+    backup.velero.io/backup-volumes: "fluxot-mlflow-postgres-pvc"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: gp3-csi
+  volumeMode: Filesystem

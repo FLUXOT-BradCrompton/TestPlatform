@@ -1,0 +1,464 @@
+# Flux OT Platform — Helm Values
+# Override any value with --set or a -f values-override.yaml file.
+# Sensitive values should be supplied via an external secrets mechanism
+# (SealedSecrets, Vault Agent, External Secrets Operator) and never
+# placed directly in this file.
+
+# ============================================================
+# Global settings
+# ============================================================
+global:
+  # Override image registry (e.g., "registry.redhat.io" or "quay.io/myorg")
+  imageRegistry: ""
+  # List of pull secret names if using a private registry
+  imagePullSecrets: []
+  # Default storage class for all PVCs — use gp3-csi on AWS/OpenShift
+  storageClass: "gp3-csi"
+  # Deployment environment label propagated to all resources
+  environment: "production"
+  # Cluster base domain — used in Route hostnames
+  clusterDomain: "apps.ocp4.fluxot.internal"
+
+# ============================================================
+# Platform API
+# ============================================================
+platformApi:
+  enabled: true
+  replicaCount: 3
+
+  image:
+    repository: fluxot/platform-api
+    tag: "1.0.0"
+    # Always pull in production to pick up security patches on recreate
+    pullPolicy: Always
+    # Optional digest pin (preferred over mutable tags in production)
+    # digest: "sha256:<digest>"
+
+  # Service
+  service:
+    type: ClusterIP
+    port: 8000
+    metricsPort: 9090
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8000"
+      prometheus.io/path: "/metrics"
+
+  # Route (OpenShift)
+  route:
+    enabled: true
+    # Hostname defaults to platform-api.<global.clusterDomain>
+    hostname: ""
+    tls:
+      termination: edge
+      insecureEdgeTerminationPolicy: Redirect
+    annotations:
+      haproxy.router.openshift.io/timeout: "120s"
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    scaleDownStabilizationWindowSeconds: 300
+    scaleUpStabilizationWindowSeconds: 0
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+
+  # Extra environment variables (merged with ConfigMap envFrom)
+  extraEnv: {}
+    # MY_EXTRA_VAR: "value"
+
+  # Config overrides applied to the ConfigMap
+  config: {}
+    # LOG_LEVEL: "DEBUG"
+    # API_WORKERS: "8"
+
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ============================================================
+# MQTT-Kafka Bridge
+# ============================================================
+mqttBridge:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: fluxot/mqtt-bridge
+    tag: "1.0.0"
+    pullPolicy: Always
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    fsGroup: 1001
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+  serviceAccount:
+    create: true
+    name: ""
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+# ============================================================
+# Kafka (AMQ Streams CRDs — requires operator installed separately)
+# When enabled, creates Kafka, KafkaTopic, and KafkaUser CRs.
+# ============================================================
+kafka:
+  enabled: true
+  clusterName: fluxot-kafka
+  version: "3.7.0"
+
+  brokers:
+    replicas: 3
+    storage:
+      size: "100Gi"
+      storageClass: ""    # Inherits global.storageClass
+      deleteClaim: false
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    jvm:
+      xms: "1g"
+      xmx: "3g"
+
+  zookeeper:
+    replicas: 3
+    storage:
+      size: "10Gi"
+      storageClass: ""
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+
+  config:
+    defaultReplicationFactor: 3
+    minInsyncReplicas: 2
+    compressionType: lz4
+    numNetworkThreads: 8
+    numIoThreads: 16
+
+  listeners:
+    plain:
+      enabled: true
+      port: 9092
+    tls:
+      enabled: true
+      port: 9093
+    external:
+      enabled: true
+      type: route
+      port: 9094
+
+  authorization:
+    type: simple
+    superUsers:
+      - User:admin
+
+  metrics:
+    enabled: true
+
+  kafkaExporter:
+    enabled: true
+
+# ============================================================
+# AMQ Broker (ActiveMQ Artemis — requires operator)
+# ============================================================
+amqBroker:
+  enabled: true
+  brokerName: fluxot-amq-broker
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+
+  storage:
+    size: "5Gi"
+    storageClass: ""    # Inherits global.storageClass
+
+  tls:
+    enabled: true
+    secretName: fluxot-amq-tls
+
+  acceptors:
+    mqtt:
+      enabled: true
+      port: 1883
+      exposed: false
+    mqttSsl:
+      enabled: true
+      port: 8883
+      exposed: true
+    amqp:
+      enabled: true
+      port: 5672
+      exposed: false
+
+# ============================================================
+# TimescaleDB
+# NOTE: For production HA, set useOperator: true and configure
+# the CrunchyData PGO PostgresCluster resource instead.
+# ============================================================
+timescaledb:
+  enabled: true
+  # Use the standalone StatefulSet (false) or CrunchyData PGO operator (true)
+  useOperator: false
+
+  image:
+    repository: timescale/timescaledb-ha
+    tag: "pg16-latest"
+    pullPolicy: Always
+
+  replicas: 1    # Increase only when useOperator: true (PGO handles HA)
+
+  storage:
+    size: "500Gi"
+    storageClass: ""    # Inherits global.storageClass
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+  database: fluxot
+  username: fluxot_app
+
+  # Secret with keys: POSTGRES_PASSWORD, APP_USER_PASSWORD, REPLICATION_PASSWORD
+  credentialsSecret: fluxot-timescaledb-credentials
+
+  sharedMemory:
+    size: "256Mi"
+
+  config:
+    sharedBuffers: "1GB"
+    effectiveCacheSize: "3GB"
+    workMem: "64MB"
+    maintenanceWorkMem: "256MB"
+    maxConnections: 200
+
+  # Disable the Bitnami postgresql sub-chart when using timescaledb
+  postgresql:
+    enabled: false
+
+# ============================================================
+# Redis (Bitnami sub-chart)
+# ============================================================
+redis:
+  enabled: true
+  architecture: standalone    # Use "replication" for HA with Sentinel
+  auth:
+    enabled: true
+    existingSecret: fluxot-redis-credentials
+    existingSecretPasswordKey: REDIS_PASSWORD
+  master:
+    persistence:
+      enabled: true
+      size: "10Gi"
+      storageClass: ""    # Inherits global.storageClass
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: fluxot-monitoring
+
+# ============================================================
+# Monitoring
+# ============================================================
+monitoring:
+  prometheus:
+    enabled: true
+    # If using OpenShift built-in monitoring, set to false and configure
+    # user workload monitoring instead.
+    deploy: false    # true = deploy standalone Prometheus via operator
+    serviceMonitor:
+      enabled: true
+      scrapeInterval: "15s"
+      namespace: fluxot-monitoring
+
+  grafana:
+    enabled: true
+    # Grafana is deployed via grafana-instance.yaml; set deploy: false
+    # when using that separate manifest.
+    deploy: false
+
+  prometheusRules:
+    enabled: true
+    namespace: fluxot-monitoring
+
+  alertmanager:
+    enabled: true
+    # Alertmanager config — override with production webhook/pagerduty receivers
+    config:
+      global:
+        resolve_timeout: 5m
+      route:
+        receiver: "default"
+        group_by: ["alertname", "site_id", "skid_id"]
+        group_wait: 10s
+        group_interval: 5m
+        repeat_interval: 4h
+      receivers:
+        - name: "default"
+          # Replace with your alerting channel:
+          # webhook_configs, pagerduty_configs, slack_configs, etc.
+          webhook_configs: []
+
+# ============================================================
+# Security
+# ============================================================
+security:
+  tls:
+    enabled: true
+
+  networkPolicies:
+    enabled: true
+    # When false, no NetworkPolicy resources are created (useful for dev)
+
+  podSecurityStandards:
+    enabled: true
+    # Profile: restricted (API/monitoring), baseline (Kafka/Zookeeper)
+    profile: restricted
+
+  # SealedSecrets controller — set to true if using Bitnami SealedSecrets
+  sealedSecrets:
+    enabled: false
+
+# ============================================================
+# ServiceAccount defaults
+# ============================================================
+serviceAccount:
+  create: true
+  annotations: {}
+
+# ============================================================
+# Namespace configuration
+# Apply separately via namespaces.yaml; this flag gates
+# whether the chart creates namespace resources.
+# ============================================================
+namespaces:
+  create: false    # Set to true only for fresh installs without pre-existing namespaces
+
+# ============================================================
+# Image pull secrets (global)
+# ============================================================
+imagePullSecrets: []
+# - name: fluxot-registry-credentials
+
+# ============================================================
+# Common labels added to all resources
+# ============================================================
+commonLabels: {}
+# team: platform
+# cost-center: industrial-iot
+
+# ============================================================
+# Common annotations added to all resources
+# ============================================================
+commonAnnotations: {}

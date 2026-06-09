@@ -1,0 +1,280 @@
+# Flux OT — NetworkPolicy for fluxot-platform namespace
+# Implements a default-deny posture with explicit allow rules:
+#   - API: ingress from OpenShift router + monitoring; egress to messaging + AI + DNS
+#   - Bridge: ingress from messaging namespace; egress to messaging namespace + DNS
+#   - TimescaleDB: ingress from API pods only; no egress beyond DNS
+#
+# OpenShift uses the OVN-Kubernetes CNI by default which supports NetworkPolicy v1.
+# Apply: oc apply -f networkpolicy.yaml -n fluxot-platform
+---
+# ============================================================
+# Default Deny — block all ingress and egress not explicitly allowed
+# This must be applied FIRST before any allow rules.
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: deny
+spec:
+  podSelector: {}    # Applies to ALL pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# ============================================================
+# DNS Egress — allow all pods to resolve DNS (UDP/TCP 53)
+# Required for all other egress rules to be effective.
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: allow
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# ============================================================
+# Platform API — Ingress rules
+# Allows:
+#   1. OpenShift Ingress Controller (router) pods from openshift-ingress namespace
+#   2. Monitoring scrape from fluxot-monitoring namespace
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-ingress
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: allow
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxot-platform-api
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow OpenShift Router (HAProxy) to forward HTTPS traffic to the API
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # Allow Prometheus scraping from the monitoring namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fluxot-monitoring
+      ports:
+        - protocol: TCP
+          port: 8000    # /metrics endpoint on the main port
+        - protocol: TCP
+          port: 9090    # Dedicated metrics port (if separated)
+
+    # Allow internal health checks / readiness probes from the kubelet
+    # (kubelet connects from the node network, not via namespace selector)
+    - ports:
+        - protocol: TCP
+          port: 8000
+---
+# ============================================================
+# Platform API — Egress rules
+# Allows:
+#   1. Kafka bootstrap + broker ports in fluxot-messaging
+#   2. AMQ Broker AMQP port in fluxot-messaging
+#   3. AI inference service in fluxot-ai
+#   4. TimescaleDB within the same namespace
+#   5. Redis within the same namespace
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-egress
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: allow
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxot-platform-api
+  policyTypes:
+    - Egress
+  egress:
+    # Kafka (plain + TLS listeners)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fluxot-messaging
+      ports:
+        - protocol: TCP
+          port: 9092    # Kafka plain
+        - protocol: TCP
+          port: 9093    # Kafka TLS
+        - protocol: TCP
+          port: 9094    # Kafka external/route
+        - protocol: TCP
+          port: 5672    # AMQ Broker AMQP
+        - protocol: TCP
+          port: 1883    # AMQ Broker MQTT (plain, internal only)
+
+    # AI inference service
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fluxot-ai
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # TimescaleDB (same namespace)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fluxot-timescaledb
+      ports:
+        - protocol: TCP
+          port: 5432
+
+    # Redis (same namespace)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# ============================================================
+# MQTT Bridge — Ingress rules
+# Bridge initiates connections; there are no external callers.
+# Only the monitoring namespace may scrape it.
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-bridge-ingress
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: allow
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxot-mqtt-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    # Prometheus scraping from monitoring namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fluxot-monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# ============================================================
+# MQTT Bridge — Egress rules
+# Bridge connects outbound to AMQ Broker and Kafka only.
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-bridge-egress
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: allow
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxot-mqtt-bridge
+  policyTypes:
+    - Egress
+  egress:
+    # AMQ Broker MQTT and Kafka in messaging namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fluxot-messaging
+      ports:
+        - protocol: TCP
+          port: 1883    # MQTT plain
+        - protocol: TCP
+          port: 8883    # MQTT TLS
+        - protocol: TCP
+          port: 5672    # AMQP
+        - protocol: TCP
+          port: 9092    # Kafka plain
+        - protocol: TCP
+          port: 9093    # Kafka TLS
+---
+# ============================================================
+# TimescaleDB — Ingress rules
+# Only the Platform API pods may connect to PostgreSQL.
+# The postgres-exporter sidecar scraping is localhost, not network.
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-timescaledb-ingress
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    policy-type: allow
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxot-timescaledb
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the API may reach PostgreSQL
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fluxot-platform-api
+      ports:
+        - protocol: TCP
+          port: 5432
+
+    # Prometheus may scrape the postgres_exporter sidecar metrics port
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fluxot-monitoring
+      ports:
+        - protocol: TCP
+          port: 9187
+---
+# ============================================================
+# TimescaleDB — Egress rules (none beyond DNS)
+# The database does not initiate outbound connections.
+# ============================================================
+# (DNS egress is covered by the namespace-wide allow-dns-egress policy above)

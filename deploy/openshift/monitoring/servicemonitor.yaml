@@ -1,0 +1,264 @@
+# Flux OT — ServiceMonitor definitions for Prometheus scraping
+# Prometheus Operator discovers these resources via label selectors on the
+# Prometheus CR. Ensure the Prometheus instance has a serviceMonitorSelector
+# that matches the labels below.
+#
+# Apply: oc apply -f servicemonitor.yaml -n fluxot-monitoring
+---
+# ============================================================
+# Platform API — scrape /metrics every 15 seconds
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-platform-api
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: platform-api-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    # Selector label matched by the Prometheus CR
+    release: prometheus
+spec:
+  # Match services in the fluxot-platform namespace
+  namespaceSelector:
+    matchNames:
+      - fluxot-platform
+  selector:
+    matchLabels:
+      app: fluxot-platform-api
+  endpoints:
+    - port: http          # Named port 8000 on the Service
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      scheme: http
+      # Honor labels from the application metrics (avoids label conflicts)
+      honorLabels: false
+      honorTimestamps: true
+      # Relabelling: add namespace and pod labels to all metrics
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app]
+          targetLabel: app
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+      # Drop high-cardinality debug metrics not needed in production
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: "go_(gc_.*|memstats_.*|goroutines|threads|sched.*)"
+          action: drop
+---
+# ============================================================
+# Kafka (AMQ Streams JMX exporter) — scrape every 30 seconds
+# The Kafka CR configures the JMX exporter on port 9404.
+# AMQ Streams creates a Service named <cluster>-kafka-brokers with port 9404.
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-kafka-brokers
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: kafka-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - fluxot-messaging
+  selector:
+    matchLabels:
+      strimzi.io/cluster: fluxot-kafka
+      strimzi.io/kind: Kafka
+  endpoints:
+    - port: tcp-prometheus   # Port name set by AMQ Streams JMX exporter
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      scheme: http
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_strimzi_io_cluster]
+          targetLabel: kafka_cluster
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: kafka_broker
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+      metricRelabelings:
+        # Keep only the metrics needed for alerting and dashboards
+        - sourceLabels: [__name__]
+          regex: "kafka_(server|controller|network|log|cluster).*|jvm_.*|zookeeper_.*"
+          action: keep
+---
+# ============================================================
+# ZooKeeper (via AMQ Streams JMX exporter)
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-kafka-zookeeper
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: zookeeper-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - fluxot-messaging
+  selector:
+    matchLabels:
+      strimzi.io/cluster: fluxot-kafka
+      strimzi.io/kind: Kafka
+      strimzi.io/name: fluxot-kafka-zookeeper
+  endpoints:
+    - port: tcp-prometheus
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      scheme: http
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_strimzi_io_cluster]
+          targetLabel: kafka_cluster
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: zookeeper_node
+---
+# ============================================================
+# Kafka Exporter — consumer group lag metrics
+# AMQ Streams deploys a kafka-exporter pod when kafkaExporter is configured.
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-kafka-exporter
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: kafka-exporter-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - fluxot-messaging
+  selector:
+    matchLabels:
+      strimzi.io/cluster: fluxot-kafka
+      strimzi.io/kind: KafkaExporter
+  endpoints:
+    - port: tcp-prometheus
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_strimzi_io_cluster]
+          targetLabel: kafka_cluster
+---
+# ============================================================
+# AI Inference Service — scrape /metrics every 30 seconds
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-ai-inference
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: ai-inference-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - fluxot-ai
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-inference
+      app.kubernetes.io/part-of: fluxot-platform
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      scheme: http
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          targetLabel: service
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+---
+# ============================================================
+# MQTT Bridge — scrape health/metrics endpoint
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-mqtt-bridge
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: mqtt-bridge-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - fluxot-platform
+  selector:
+    matchLabels:
+      app: fluxot-mqtt-bridge
+  endpoints:
+    - port: health
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 15s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+---
+# ============================================================
+# TimescaleDB (postgres_exporter sidecar)
+# ============================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluxot-timescaledb
+  namespace: fluxot-monitoring
+  labels:
+    app.kubernetes.io/name: timescaledb-monitor
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: monitoring
+    environment: production
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - fluxot-platform
+  selector:
+    matchLabels:
+      app: fluxot-timescaledb
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - targetLabel: job
+          replacement: timescaledb

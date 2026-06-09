@@ -1,0 +1,526 @@
+# Flux OT — TimescaleDB StatefulSet + PVC
+#
+# NOTE FOR PRODUCTION:
+#   This manifest provides a standalone TimescaleDB pod for development and
+#   initial deployment validation. For a production-grade, HA PostgreSQL cluster
+#   on OpenShift, replace this StatefulSet with the CrunchyData PostgreSQL Operator
+#   (PGO): https://access.crunchydata.com/
+#   PGO provides: automated failover, PITR backups, connection pooling (pgBouncer),
+#   TLS management, and monitoring integration.
+#   PGO CRD: PostgresCluster in the postgres-operator.crunchydata.com API group.
+#
+# This single-replica StatefulSet is acceptable for:
+#   - Initial platform bootstrapping
+#   - Development / staging environments
+#   - Proof-of-concept deployments
+#
+# Apply: oc apply -f pvc-timescaledb.yaml -n fluxot-platform
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fluxot-timescaledb
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-timescaledb
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: database
+    app.kubernetes.io/version: "pg16"
+    environment: production
+  annotations:
+    fluxot.io/production-note: "Replace with CrunchyData PGO for production HA"
+spec:
+  serviceName: fluxot-timescaledb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluxot-timescaledb
+  # Retain PVC when pod is deleted — prevents accidental data loss
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: fluxot-timescaledb
+        app.kubernetes.io/name: timescaledb
+        app.kubernetes.io/part-of: fluxot-platform
+        app.kubernetes.io/component: database
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70      # postgres uid in timescaledb-ha image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+
+      serviceAccountName: fluxot-timescaledb-sa
+
+      terminationGracePeriodSeconds: 60
+
+      # --------------------------------------------------------
+      # Init container — run schema migrations / extensions setup
+      # --------------------------------------------------------
+      initContainers:
+        - name: schema-init
+          image: timescale/timescaledb-ha:pg16-latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "=== Flux OT TimescaleDB Schema Init ==="
+
+              export PGPASSWORD="${POSTGRES_PASSWORD}"
+              PG_URI="postgresql://postgres@localhost:5432/${POSTGRES_DB}"
+
+              # Wait for PostgreSQL to accept connections
+              until pg_isready -h localhost -p 5432 -U postgres; do
+                echo "  Waiting for PostgreSQL..."
+                sleep 3
+              done
+              echo "PostgreSQL is ready."
+
+              # Create application user if not exists
+              psql -h localhost -U postgres -tc \
+                "SELECT 1 FROM pg_roles WHERE rolname='${POSTGRES_USER}'" \
+                | grep -q 1 || \
+              psql -h localhost -U postgres \
+                -c "CREATE ROLE ${POSTGRES_USER} WITH LOGIN PASSWORD '${APP_USER_PASSWORD}';"
+
+              # Create database if not exists
+              psql -h localhost -U postgres -tc \
+                "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" \
+                | grep -q 1 || \
+              psql -h localhost -U postgres \
+                -c "CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER};"
+
+              # Enable TimescaleDB extension
+              psql -h localhost -U postgres -d "${POSTGRES_DB}" \
+                -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+
+              # Enable PostGIS (optional — for geographic asset tracking)
+              psql -h localhost -U postgres -d "${POSTGRES_DB}" \
+                -c "CREATE EXTENSION IF NOT EXISTS postgis;" || true
+
+              # Grant privileges
+              psql -h localhost -U postgres -d "${POSTGRES_DB}" \
+                -c "GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO ${POSTGRES_USER};"
+
+              # Apply schema (mounted from ConfigMap or init SQL)
+              if [ -f /docker-entrypoint-initdb.d/schema.sql ]; then
+                psql -h localhost -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+                  -f /docker-entrypoint-initdb.d/schema.sql
+                echo "Schema applied."
+              fi
+
+              echo "=== Schema Init Complete ==="
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: POSTGRES_USER
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: POSTGRES_DB
+            - name: APP_USER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: APP_USER_PASSWORD
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # PostgreSQL needs to write to PGDATA
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: timescaledb-data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+            - name: shm
+              mountPath: /dev/shm
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+
+      # --------------------------------------------------------
+      # Main TimescaleDB container
+      # --------------------------------------------------------
+      containers:
+        - name: timescaledb
+          image: timescale/timescaledb-ha:pg16-latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # PostgreSQL writes to PGDATA
+            capabilities:
+              drop: [ALL]
+
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: POSTGRES_DB
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # TimescaleDB tuning for industrial telemetry workload
+            - name: TS_TUNE_MEMORY
+              value: "3GB"
+            - name: TS_TUNE_NUM_CPUS
+              value: "2"
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+                - -d
+                - fluxot
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+                - -d
+                - fluxot
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: timescaledb-data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+            - name: shm
+              mountPath: /dev/shm
+            - name: postgresql-config
+              mountPath: /etc/postgresql/conf.d
+              readOnly: true
+
+        # ---- Sidecar: postgres_exporter for Prometheus ----
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9187
+              protocol: TCP
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-timescaledb-credentials
+                  key: APP_USER_PASSWORD
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+
+      # --------------------------------------------------------
+      # Volumes
+      # --------------------------------------------------------
+      volumes:
+        # Shared memory — PostgreSQL requires /dev/shm for parallel queries
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "256Mi"
+        # PostgreSQL config tuning overrides
+        - name: postgresql-config
+          configMap:
+            name: fluxot-timescaledb-config
+            defaultMode: 0444
+        # Init SQL scripts
+        - name: init-scripts
+          configMap:
+            name: fluxot-timescaledb-init-scripts
+            defaultMode: 0444
+
+  # --------------------------------------------------------
+  # Persistent Volume Claim template — 500Gi per replica
+  # --------------------------------------------------------
+  volumeClaimTemplates:
+    - metadata:
+        name: timescaledb-data
+        labels:
+          app.kubernetes.io/part-of: fluxot-platform
+          app.kubernetes.io/component: database
+          environment: production
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: gp3-csi
+        resources:
+          requests:
+            storage: 500Gi
+---
+# ============================================================
+# ClusterIP Service for TimescaleDB
+# Internal only — no external route for the database.
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxot-timescaledb
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-timescaledb
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: database
+    environment: production
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9187"
+spec:
+  type: ClusterIP
+  selector:
+    app: fluxot-timescaledb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+    - name: metrics
+      port: 9187
+      targetPort: metrics
+      protocol: TCP
+---
+# Headless service for StatefulSet DNS (pod-level addressing)
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxot-timescaledb-headless
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-timescaledb
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: fluxot-timescaledb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# ============================================================
+# ServiceAccount
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluxot-timescaledb-sa
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: database
+    environment: production
+---
+# ============================================================
+# PostgreSQL tuning ConfigMap
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-timescaledb-config
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: database
+    environment: production
+data:
+  fluxot.conf: |
+    # Flux OT TimescaleDB tuning for industrial telemetry workload
+    # Applied via postgresql.conf include mechanism
+
+    # Memory
+    shared_buffers = 1GB
+    effective_cache_size = 3GB
+    work_mem = 64MB
+    maintenance_work_mem = 256MB
+    wal_buffers = 64MB
+
+    # WAL / durability
+    wal_level = replica
+    max_wal_size = 2GB
+    min_wal_size = 256MB
+    checkpoint_completion_target = 0.9
+    synchronous_commit = on
+
+    # Query planner
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    default_statistics_target = 200
+
+    # Connection limits
+    max_connections = 200
+
+    # TimescaleDB specific
+    timescaledb.max_background_workers = 8
+    timescaledb.telemetry_level = off
+
+    # Logging — structured for log aggregation
+    log_min_duration_statement = 1000
+    log_checkpoints = on
+    log_connections = on
+    log_disconnections = on
+    log_line_prefix = '%t [%p]: user=%u,db=%d,app=%a,client=%h '
+    log_lock_waits = on
+    log_temp_files = 0
+    log_autovacuum_min_duration = 0
+---
+# ============================================================
+# Init scripts ConfigMap — base schema for Flux OT tables
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-timescaledb-init-scripts
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: database
+    environment: production
+data:
+  schema.sql: |
+    -- Flux OT base schema
+    -- This creates the foundational tables; application migrations handle the rest.
+
+    -- Telemetry hypertable
+    CREATE TABLE IF NOT EXISTS telemetry (
+        time            TIMESTAMPTZ NOT NULL,
+        site_id         TEXT        NOT NULL,
+        skid_id         TEXT        NOT NULL,
+        device_id       TEXT        NOT NULL,
+        metric_name     TEXT        NOT NULL,
+        value           DOUBLE PRECISION,
+        unit            TEXT,
+        quality         SMALLINT DEFAULT 0,
+        metadata        JSONB
+    );
+    SELECT create_hypertable('telemetry', 'time', if_not_exists => TRUE);
+    SELECT add_compression_policy('telemetry', INTERVAL '7 days', if_not_exists => TRUE);
+    CREATE INDEX IF NOT EXISTS idx_telemetry_site_skid_time ON telemetry (site_id, skid_id, time DESC);
+    CREATE INDEX IF NOT EXISTS idx_telemetry_device_time   ON telemetry (device_id, time DESC);
+
+    -- Alerts table
+    CREATE TABLE IF NOT EXISTS alerts (
+        id              BIGSERIAL PRIMARY KEY,
+        time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        site_id         TEXT        NOT NULL,
+        skid_id         TEXT        NOT NULL,
+        device_id       TEXT,
+        alert_type      TEXT        NOT NULL,
+        severity        TEXT        NOT NULL CHECK (severity IN ('INFO','WARNING','CRITICAL','EMERGENCY')),
+        message         TEXT,
+        acknowledged    BOOLEAN     DEFAULT FALSE,
+        acknowledged_at TIMESTAMPTZ,
+        acknowledged_by TEXT,
+        resolved        BOOLEAN     DEFAULT FALSE,
+        resolved_at     TIMESTAMPTZ,
+        metadata        JSONB
+    );
+    CREATE INDEX IF NOT EXISTS idx_alerts_site_time     ON alerts (site_id, time DESC);
+    CREATE INDEX IF NOT EXISTS idx_alerts_unresolved    ON alerts (site_id, skid_id) WHERE resolved = FALSE;
+
+    -- Device registry
+    CREATE TABLE IF NOT EXISTS devices (
+        device_id       TEXT        PRIMARY KEY,
+        site_id         TEXT        NOT NULL,
+        skid_id         TEXT        NOT NULL,
+        device_type     TEXT        NOT NULL,
+        protocol        TEXT        NOT NULL,
+        config          JSONB,
+        last_seen       TIMESTAMPTZ,
+        status          TEXT        DEFAULT 'unknown',
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- AI predictions hypertable
+    CREATE TABLE IF NOT EXISTS ai_predictions (
+        time            TIMESTAMPTZ NOT NULL,
+        site_id         TEXT        NOT NULL,
+        skid_id         TEXT        NOT NULL,
+        model_name      TEXT        NOT NULL,
+        model_version   TEXT        NOT NULL,
+        prediction_type TEXT        NOT NULL,
+        score           DOUBLE PRECISION,
+        confidence      DOUBLE PRECISION,
+        features        JSONB,
+        metadata        JSONB
+    );
+    SELECT create_hypertable('ai_predictions', 'time', if_not_exists => TRUE);
+    SELECT add_compression_policy('ai_predictions', INTERVAL '30 days', if_not_exists => TRUE);
+    CREATE INDEX IF NOT EXISTS idx_ai_pred_site_time ON ai_predictions (site_id, time DESC);
+
+    GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO fluxot_app;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fluxot_app;

@@ -1,0 +1,349 @@
+# Flux OT — AMQ Streams Kafka Cluster
+# Production cluster: 3 brokers, 3 ZooKeeper nodes
+# Persistent 100Gi storage per broker, full TLS + SCRAM auth, Prometheus metrics
+#
+# Prerequisites: AMQ Streams operator installed in fluxot-messaging namespace
+# Apply: oc apply -f kafka-cluster.yaml -n fluxot-messaging
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: fluxot-kafka
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: messaging
+    environment: production
+spec:
+  kafka:
+    version: "3.7.0"
+    replicas: 3
+
+    # --------------------------------------------------------
+    # Listeners
+    # --------------------------------------------------------
+    listeners:
+      # Internal plain listener — for in-cluster services that handle their own TLS
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+        authentication:
+          type: scram-sha-512
+
+      # Internal TLS listener — mutual TLS with SCRAM for sensitive services
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: scram-sha-512
+        configuration:
+          brokerCertChainAndKey:
+            secretName: fluxot-kafka-tls
+            certificate: tls.crt
+            key: tls.key
+
+      # External Route listener — exposes each broker via OpenShift Route (SNI routing)
+      - name: external
+        port: 9094
+        type: route
+        tls: true
+        authentication:
+          type: scram-sha-512
+        configuration:
+          # Broker address overrides allow external clients to connect per-broker
+          brokerCertChainAndKey:
+            secretName: fluxot-kafka-external-tls
+            certificate: tls.crt
+            key: tls.key
+
+    # --------------------------------------------------------
+    # Authorization
+    # --------------------------------------------------------
+    authorization:
+      type: simple
+      superUsers:
+        - User:admin
+        - User:fluxot-kafka-admin
+
+    # --------------------------------------------------------
+    # Storage — JBOD with one persistent volume per broker
+    # --------------------------------------------------------
+    storage:
+      type: jbod
+      volumes:
+        - id: 0
+          type: persistent-claim
+          size: 100Gi
+          storageClass: gp3-csi
+          deleteClaim: false
+
+    # --------------------------------------------------------
+    # Rack awareness — spread across OpenShift availability zones
+    # --------------------------------------------------------
+    rack:
+      topologyKey: topology.kubernetes.io/zone
+
+    # --------------------------------------------------------
+    # Broker configuration
+    # --------------------------------------------------------
+    config:
+      # Replication and reliability
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      # Log management
+      log.retention.hours: 168
+      log.segment.bytes: 1073741824
+      log.cleanup.policy: delete
+      # Compression
+      compression.type: lz4
+      # Performance tuning for industrial telemetry throughput
+      num.network.threads: 8
+      num.io.threads: 16
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600
+      # Inter-broker communication protocol
+      inter.broker.protocol.version: "3.7"
+
+    # --------------------------------------------------------
+    # Resource limits
+    # --------------------------------------------------------
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+
+    # --------------------------------------------------------
+    # JVM settings
+    # --------------------------------------------------------
+    jvmOptions:
+      -Xms: "1g"
+      -Xmx: "3g"
+      gcLoggingEnabled: false
+      javaSystemProperties:
+        - name: com.sun.jndi.rmiURLParsing
+          value: legacy
+
+    # --------------------------------------------------------
+    # Prometheus / JMX metrics
+    # --------------------------------------------------------
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: fluxot-kafka-metrics
+          key: kafka-metrics-config.yml
+
+    # --------------------------------------------------------
+    # Pod template overrides
+    # --------------------------------------------------------
+    template:
+      pod:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: fluxot-platform
+            environment: production
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "9404"
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: strimzi.io/name
+                      operator: In
+                      values:
+                        - fluxot-kafka-kafka
+                topologyKey: kubernetes.io/hostname
+        tolerations: []
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+
+  # --------------------------------------------------------
+  # ZooKeeper
+  # --------------------------------------------------------
+  zookeeper:
+    replicas: 3
+    storage:
+      type: persistent-claim
+      size: 10Gi
+      storageClass: gp3-csi
+      deleteClaim: false
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+    jvmOptions:
+      -Xms: "512m"
+      -Xmx: "1g"
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: fluxot-kafka-metrics
+          key: zookeeper-metrics-config.yml
+    template:
+      pod:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: strimzi.io/name
+                      operator: In
+                      values:
+                        - fluxot-kafka-zookeeper
+                topologyKey: kubernetes.io/hostname
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+
+  # --------------------------------------------------------
+  # Entity Operator (topic + user operators)
+  # --------------------------------------------------------
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+      reconciliationIntervalSeconds: 90
+    userOperator:
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+      reconciliationIntervalSeconds: 90
+
+  # --------------------------------------------------------
+  # Kafka Exporter — consumer group lag metrics
+  # --------------------------------------------------------
+  kafkaExporter:
+    topicRegex: ".*"
+    groupRegex: ".*"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+    enableSaramaLogging: false
+---
+# ConfigMap for Kafka Prometheus JMX exporter configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-kafka-metrics
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: messaging
+    environment: production
+data:
+  kafka-metrics-config.yml: |
+    # Flux OT Kafka JMX → Prometheus metrics configuration
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      # Kafka server request metrics
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          topic: "$4"
+          partition: "$5"
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), brokerHost=(.+), brokerPort=(.+)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          broker: "$4:$5"
+      - pattern: kafka.server<type=(.+), name=(.+)><>OneMinuteRate
+        name: kafka_server_$1_$2_rate
+        type: GAUGE
+      - pattern: kafka.server<type=(.+), name=(.+)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+      # Controller metrics
+      - pattern: kafka.controller<type=(.+), name=(.+)><>Value
+        name: kafka_controller_$1_$2
+        type: GAUGE
+      # Network metrics
+      - pattern: kafka.network<type=(.+), name=(.+), request=(.+)><>Value
+        name: kafka_network_$1_$2
+        type: GAUGE
+        labels:
+          request: "$3"
+      # Log metrics
+      - pattern: kafka.log<type=(.+), name=(.+), topic=(.+), partition=(.+)><>Value
+        name: kafka_log_$1_$2
+        type: GAUGE
+        labels:
+          topic: "$3"
+          partition: "$4"
+      # JVM GC metrics
+      - pattern: java.lang<type=GarbageCollector, name=(.+)><>CollectionCount
+        name: jvm_gc_collection_count_total
+        type: COUNTER
+        labels:
+          gc: "$1"
+      - pattern: java.lang<type=GarbageCollector, name=(.+)><>CollectionTime
+        name: jvm_gc_collection_time_ms_total
+        type: COUNTER
+        labels:
+          gc: "$1"
+      # JVM Memory
+      - pattern: java.lang<type=Memory><>HeapMemoryUsage.used
+        name: jvm_memory_heap_used_bytes
+        type: GAUGE
+      - pattern: java.lang<type=Memory><>NonHeapMemoryUsage.used
+        name: jvm_memory_nonheap_used_bytes
+        type: GAUGE
+
+  zookeeper-metrics-config.yml: |
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+)><>(\\w+)"
+        name: "zookeeper_$2"
+        type: GAUGE
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+), name1=replica.(\\d+)><>(\\w+)"
+        name: "zookeeper_$3"
+        type: GAUGE
+        labels:
+          replicaId: "$2"
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+), name1=replica.(\\d+), name2=(\\w+)><>(\\w+)"
+        name: "zookeeper_$4"
+        type: GAUGE
+        labels:
+          replicaId: "$2"
+          memberType: "$3"
+      - pattern: java.lang<type=GarbageCollector, name=(.+)><>CollectionCount
+        name: jvm_gc_collection_count_total
+        type: COUNTER
+        labels:
+          gc: "$1"

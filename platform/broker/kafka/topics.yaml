@@ -1,0 +1,274 @@
+# =============================================================================
+# Flux OT Platform — Kafka Topic Definitions
+# AMQ Streams (Strimzi) KafkaTopic Custom Resources
+# =============================================================================
+# Apply with: oc apply -f topics.yaml -n fluxot
+# Or: kubectl apply -f topics.yaml -n fluxot
+#
+# Topic naming convention: fluxot.{site_id}.{skid_type}.{skid_id}.{message_type}
+#
+# NOTE: Wildcard / pattern topics cannot be declared as static CRDs.
+# The templates below are for representative per-site/skid instances.
+# For dynamic topic creation, configure auto.create.topics.enable=false and
+# use the Kafka Admin API or a topic-provisioning operator.
+# =============================================================================
+
+---
+# ---------------------------------------------------------------------------
+# Dead Letter Queue — shared across all sites/skids
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-dlq
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    fluxot/topic-type: dlq
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "2592000000"       # 30 days
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+    message.timestamp.type: LogAppendTime
+
+---
+# ---------------------------------------------------------------------------
+# Template topic — Telemetry
+# Replicate this block per site/skid, substituting the metadata.name and
+# the topic key in config.
+# Partition count 12 supports ~12 skids at high throughput per site.
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-belt-rip-monitor-brm-nwm-001-telemetry
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    fluxot/site: mt-newman
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: telemetry
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.telemetry"
+spec:
+  topicName: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.telemetry"
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "604800000"        # 7 days
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+    max.message.bytes: "1048576"     # 1 MiB
+    message.timestamp.type: CreateTime
+    # TimescaleDB ingestion performs well with smaller segment sizes
+    segment.bytes: "268435456"       # 256 MiB
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-pilbara-belt-rip-monitor-brm-plb-001-telemetry
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: pilbara
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: telemetry
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.pilbara.belt_rip_monitor.brm-plb-001.telemetry"
+spec:
+  topicName: "fluxot.pilbara.belt_rip_monitor.brm-plb-001.telemetry"
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "604800000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+    max.message.bytes: "1048576"
+    message.timestamp.type: CreateTime
+
+---
+# ---------------------------------------------------------------------------
+# Template topic — Alerts
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-belt-rip-monitor-brm-nwm-001-alerts
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: mt-newman
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: alerts
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.alerts"
+spec:
+  topicName: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.alerts"
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "2592000000"       # 30 days
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-pilbara-belt-rip-monitor-brm-plb-001-alerts
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: pilbara
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: alerts
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.pilbara.belt_rip_monitor.brm-plb-001.alerts"
+spec:
+  topicName: "fluxot.pilbara.belt_rip_monitor.brm-plb-001.alerts"
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "2592000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+
+---
+# ---------------------------------------------------------------------------
+# Template topic — Commands
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-belt-rip-monitor-brm-nwm-001-commands
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: mt-newman
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: commands
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.commands"
+spec:
+  topicName: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.commands"
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "604800000"        # 7 days
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+    # Commands must be ordered per skid — single partition per skid is safer
+    # but 6 partitions with skid_id as key ensures ordering per skid
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-road-crossing-rxs-nwm-001-commands
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: mt-newman
+    fluxot/skid-type: road-crossing
+    fluxot/message-type: commands
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.road_crossing.rxs-nwm-001.commands"
+spec:
+  topicName: "fluxot.mt-newman.road_crossing.rxs-nwm-001.commands"
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "604800000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+
+---
+# ---------------------------------------------------------------------------
+# Template topic — Heartbeat
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-belt-rip-monitor-brm-nwm-001-heartbeat
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: mt-newman
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: heartbeat
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.heartbeat"
+spec:
+  topicName: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.heartbeat"
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "86400000"         # 1 day
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+
+---
+# ---------------------------------------------------------------------------
+# Template topic — Writeback
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-belt-rip-monitor-brm-nwm-001-writeback
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: mt-newman
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: writeback
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.writeback"
+spec:
+  topicName: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.writeback"
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "7776000000"       # 90 days — full audit retention
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy
+
+---
+# ---------------------------------------------------------------------------
+# Template topic — AI Predictions
+# ---------------------------------------------------------------------------
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-mt-newman-belt-rip-monitor-brm-nwm-001-ai-predictions
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    fluxot/site: mt-newman
+    fluxot/skid-type: belt-rip-monitor
+    fluxot/message-type: ai-predictions
+  annotations:
+    fluxot/kafka-topic-name: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.ai-predictions"
+spec:
+  topicName: "fluxot.mt-newman.belt_rip_monitor.brm-nwm-001.ai-predictions"
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "7776000000"       # 90 days
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: snappy

@@ -1,0 +1,195 @@
+# Flux OT — Kafka Topic Definitions
+# All topics use replication factor 3 (matches broker count).
+# min.insync.replicas=2 ensures at-least-one redundant copy is always in sync.
+# Managed by the AMQ Streams Entity Operator (KafkaTopic CRD).
+#
+# Apply: oc apply -f kafka-topics.yaml -n fluxot-messaging
+---
+# ============================================================
+# fluxot-telemetry
+# High-throughput sensor telemetry from all edge devices.
+# 12 partitions allows 12 parallel consumers; lz4 reduces wire size.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-telemetry
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: telemetry
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "604800000"          # 7 days
+    min.insync.replicas: "2"
+    compression.type: lz4
+    cleanup.policy: delete
+    segment.ms: "86400000"             # Roll segments daily
+    max.message.bytes: "1048576"       # 1 MiB max message (telemetry payloads are small)
+    message.timestamp.type: CreateTime
+    # Ensure consumers can reprocess events in backfill scenarios
+    delete.retention.ms: "86400000"
+---
+# ============================================================
+# fluxot-alerts
+# Safety and operational alerts from edge devices and AI engine.
+# Longer retention (30 days) for post-incident analysis.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-alerts
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: alerts
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "2592000000"         # 30 days
+    min.insync.replicas: "2"
+    compression.type: lz4
+    cleanup.policy: delete
+    segment.ms: "86400000"
+    max.message.bytes: "1048576"
+    # Alerts must not be lost — use highest durability settings
+    unclean.leader.election.enable: "false"
+---
+# ============================================================
+# fluxot-commands
+# Downstream commands sent to edge devices (emergency stop, speed change, etc.)
+# CRITICAL: unclean.leader.election.enable=false — no message loss.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-commands
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: commands
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "604800000"          # 7 days
+    min.insync.replicas: "2"
+    compression.type: none             # Commands must not be delayed by compression
+    cleanup.policy: delete
+    max.message.bytes: "65536"         # Commands are small; cap to prevent abuse
+    unclean.leader.election.enable: "false"
+    message.timestamp.type: CreateTime
+---
+# ============================================================
+# fluxot-heartbeat
+# Periodic liveness signals from all edge nodes.
+# Short retention (1 day) — only current state matters.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-heartbeat
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: heartbeat
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "86400000"           # 1 day
+    min.insync.replicas: "2"
+    compression.type: lz4
+    cleanup.policy: delete
+    segment.ms: "43200000"             # Roll every 12 hours
+    max.message.bytes: "65536"
+---
+# ============================================================
+# fluxot-writeback
+# Bi-directional state write-back from platform to edge.
+# Long retention (90 days) for audit and replay.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-writeback
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: writeback
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "7776000000"         # 90 days
+    min.insync.replicas: "2"
+    compression.type: lz4
+    cleanup.policy: delete
+    segment.ms: "86400000"
+    max.message.bytes: "1048576"
+    unclean.leader.election.enable: "false"
+---
+# ============================================================
+# fluxot-ai-predictions
+# AI/ML model output: anomaly scores, predictive maintenance forecasts.
+# 90-day retention for model audit trail.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-ai-predictions
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: ai-predictions
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "7776000000"         # 90 days
+    min.insync.replicas: "2"
+    compression.type: lz4
+    cleanup.policy: delete
+    segment.ms: "86400000"
+    max.message.bytes: "2097152"       # 2 MiB — AI payloads may include feature vectors
+---
+# ============================================================
+# fluxot-dlq
+# Dead-Letter Queue: messages that failed processing after retries.
+# Long retention (30 days) so engineers can inspect and replay.
+# ============================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fluxot-dlq
+  namespace: fluxot-messaging
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+    topic-type: dlq
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "2592000000"         # 30 days
+    min.insync.replicas: "2"
+    compression.type: none             # Keep failed messages uncompressed for debugging
+    cleanup.policy: delete
+    segment.ms: "86400000"
+    max.message.bytes: "10485760"      # 10 MiB — include original payload + error context

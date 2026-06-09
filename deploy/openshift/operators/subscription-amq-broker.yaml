@@ -1,0 +1,43 @@
+# Flux OT — AMQ Broker Operator Subscription
+# Red Hat AMQ Broker (ActiveMQ Artemis) provides the MQTT gateway for IoT devices.
+# Scoped to the fluxot-messaging namespace alongside AMQ Streams.
+#
+# Apply: oc apply -f subscription-amq-broker.yaml
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: OperatorGroup
+metadata:
+  name: amq-broker-operatorgroup
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: mqtt-broker
+    environment: production
+spec:
+  targetNamespaces:
+    - fluxot-messaging
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: amq-broker-rhel8
+  namespace: fluxot-messaging
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: mqtt-broker
+    environment: production
+spec:
+  channel: 7.12.x
+  installPlanApproval: Automatic
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  name: amq-broker-rhel8
+  # startingCSV: amq-broker-operator.v7.12.0.opr-2
+  config:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"

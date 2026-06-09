@@ -1,0 +1,262 @@
+{{/*
+Flux OT Platform — API Deployment (Helm-templated)
+Rendered from .Values.platformApi
+*/}}
+{{- if .Values.platformApi.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  {{- with (include "flux-ot-platform.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.platformApi.autoscaling.enabled }}
+  replicas: {{ .Values.platformApi.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "flux-ot-platform.api.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  revisionHistoryLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "flux-ot-platform.api.selectorLabels" . | nindent 8 }}
+        {{- include "flux-ot-platform.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.platformApi.service.port | quote }}
+        prometheus.io/path: "/metrics"
+        {{- with .Values.platformApi.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "flux-ot-platform.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "flux-ot-platform.api.serviceAccountName" . }}
+
+      securityContext:
+        {{- toYaml .Values.platformApi.securityContext | nindent 8 }}
+
+      {{- with .Values.platformApi.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew | default 1 }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | default "DoNotSchedule" }}
+          labelSelector:
+            matchLabels:
+              {{- include "flux-ot-platform.api.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+
+      affinity:
+        {{- if .Values.platformApi.affinity }}
+        {{- toYaml .Values.platformApi.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "flux-ot-platform.api.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+        {{- end }}
+
+      {{- with .Values.platformApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.platformApi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      terminationGracePeriodSeconds: 60
+
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until nc -z {{ include "flux-ot-platform.fullname" . }}-timescaledb.{{ .Release.Namespace }}.svc.cluster.local 5432; do
+                echo "Waiting for TimescaleDB..."; sleep 5
+              done
+              echo "TimescaleDB ready."
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "32Mi"
+
+      containers:
+        - name: platform-api
+          image: {{ include "flux-ot-platform.image" (dict "image" .Values.platformApi.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.platformApi.image.pullPolicy }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.platformApi.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.platformApi.service.metricsPort }}
+              protocol: TCP
+
+          securityContext:
+            {{- toYaml .Values.platformApi.containerSecurityContext | nindent 12 }}
+
+          envFrom:
+            - configMapRef:
+                name: {{ include "flux-ot-platform.fullname" . }}-config
+
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "flux-ot-platform.fullname" . }}-secrets
+                  key: DATABASE_PASSWORD
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "flux-ot-platform.fullname" . }}-secrets
+                  key: DATABASE_URL
+            - name: KAFKA_SASL_USERNAME
+              value: fluxot-api-user
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-api-user
+                  key: password
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "flux-ot-platform.fullname" . }}-secrets
+                  key: SECRET_KEY
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "flux-ot-platform.fullname" . }}-secrets
+                  key: INTERNAL_API_KEY
+            - name: MQTT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "flux-ot-platform.fullname" . }}-secrets
+                  key: MQTT_PASSWORD
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- range $key, $value := .Values.platformApi.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+
+          resources:
+            {{- toYaml .Values.platformApi.resources | nindent 12 }}
+
+          livenessProbe:
+            {{- toYaml .Values.platformApi.livenessProbe | nindent 12 }}
+
+          readinessProbe:
+            {{- toYaml .Values.platformApi.readinessProbe | nindent 12 }}
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+            - name: kafka-tls
+              mountPath: /etc/kafka/tls
+              readOnly: true
+            - name: app-config
+              mountPath: /etc/fluxot
+              readOnly: true
+
+      volumes:
+        - name: tmp-volume
+          emptyDir:
+            sizeLimit: "256Mi"
+        - name: kafka-tls
+          secret:
+            secretName: {{ .Values.kafka.clusterName }}-cluster-ca-cert
+            defaultMode: 0440
+        - name: app-config
+          configMap:
+            name: {{ include "flux-ot-platform.fullname" . }}-config
+            defaultMode: 0440
+{{- end }}
+---
+{{/*
+ServiceAccount for the API
+*/}}
+{{- if and .Values.platformApi.enabled .Values.platformApi.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "flux-ot-platform.api.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  {{- with .Values.platformApi.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+{{/*
+PodDisruptionBudget for the API
+*/}}
+{{- if and .Values.platformApi.enabled .Values.platformApi.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "flux-ot-platform.fullname" . }}-api-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flux-ot-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  minAvailable: {{ .Values.platformApi.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "flux-ot-platform.api.selectorLabels" . | nindent 6 }}
+{{- end }}

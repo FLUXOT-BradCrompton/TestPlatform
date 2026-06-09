@@ -1,0 +1,287 @@
+# Flux OT — MQTT-Kafka Bridge Deployment
+# Forwards messages between the AMQ Broker MQTT gateway and the Kafka cluster.
+# 2 replicas for availability — each maintains an independent Kafka consumer group
+# and MQTT client session so either can handle any device's messages.
+#
+# Apply: oc apply -f deployment-bridge.yaml -n fluxot-platform
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluxot-mqtt-bridge
+  namespace: fluxot-platform
+  labels:
+    app: fluxot-mqtt-bridge
+    app.kubernetes.io/name: mqtt-bridge
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: bridge
+    app.kubernetes.io/version: "1.0.0"
+    environment: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fluxot-mqtt-bridge
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  revisionHistoryLimit: 3
+  template:
+    metadata:
+      labels:
+        app: fluxot-mqtt-bridge
+        app.kubernetes.io/name: mqtt-bridge
+        app.kubernetes.io/part-of: fluxot-platform
+        app.kubernetes.io/component: bridge
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        checksum/config: ""
+    spec:
+      # --------------------------------------------------------
+      # Security
+      # --------------------------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      serviceAccountName: fluxot-bridge-sa
+
+      # Spread across nodes — bridge is stateless but traffic-critical
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: fluxot-mqtt-bridge
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: fluxot-mqtt-bridge
+                topologyKey: kubernetes.io/hostname
+
+      terminationGracePeriodSeconds: 45
+
+      # --------------------------------------------------------
+      # Init containers — wait for both MQTT broker and Kafka
+      # --------------------------------------------------------
+      initContainers:
+        - name: wait-for-mqtt
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for AMQ Broker MQTT port..."
+              until nc -z fluxot-amq-broker-mqtt-0-svc.fluxot-messaging.svc.cluster.local 1883; do
+                echo "  AMQ Broker not ready, sleeping 5s..."
+                sleep 5
+              done
+              echo "AMQ Broker MQTT is ready."
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "32Mi"
+
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for Kafka bootstrap..."
+              until nc -z fluxot-kafka-kafka-bootstrap.fluxot-messaging.svc.cluster.local 9092; do
+                echo "  Kafka not ready, sleeping 5s..."
+                sleep 5
+              done
+              echo "Kafka is ready."
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "32Mi"
+
+      # --------------------------------------------------------
+      # Main container
+      # --------------------------------------------------------
+      containers:
+        - name: mqtt-bridge
+          image: fluxot/mqtt-bridge:1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+          envFrom:
+            - configMapRef:
+                name: fluxot-platform-config
+
+          env:
+            # MQTT credentials for connecting to AMQ Broker
+            - name: MQTT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-platform-secrets
+                  key: MQTT_USERNAME
+            - name: MQTT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-platform-secrets
+                  key: MQTT_PASSWORD
+            # Kafka SCRAM credentials (secret created by AMQ Streams Entity Operator)
+            - name: KAFKA_SASL_USERNAME
+              value: fluxot-bridge-user
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-bridge-user
+                  key: password
+            # Unique client ID per replica prevents MQTT session conflicts
+            - name: MQTT_CLIENT_ID_SUFFIX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          # ---- Resource limits — edge-constrained, lower than API ----
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24    # Allow 120s for startup
+
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+            - name: kafka-tls
+              mountPath: /etc/kafka/tls
+              readOnly: true
+            - name: mqtt-tls
+              mountPath: /etc/mqtt/tls
+              readOnly: true
+
+      volumes:
+        - name: tmp-volume
+          emptyDir:
+            sizeLimit: "128Mi"
+        - name: kafka-tls
+          secret:
+            secretName: fluxot-kafka-cluster-ca-cert
+            defaultMode: 0440
+        - name: mqtt-tls
+          secret:
+            secretName: fluxot-amq-tls
+            defaultMode: 0440
+---
+# ============================================================
+# ServiceAccount
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluxot-bridge-sa
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: bridge
+    environment: production
+---
+# ============================================================
+# PodDisruptionBudget — keep at least 1 bridge replica running
+# ============================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fluxot-mqtt-bridge-pdb
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: bridge
+    environment: production
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: fluxot-mqtt-bridge

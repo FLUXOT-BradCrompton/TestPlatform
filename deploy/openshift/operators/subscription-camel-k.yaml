@@ -1,0 +1,49 @@
+# Flux OT — Camel K Operator Subscription
+# Red Hat Integration — Camel K provides lightweight integration routes
+# between MQTT, Kafka, OPC-UA, and REST endpoints.
+# Installed cluster-scoped so Integration CRDs are available in all namespaces.
+#
+# Apply: oc apply -f subscription-camel-k.yaml
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: OperatorGroup
+metadata:
+  name: camel-k-operatorgroup
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: integration
+    environment: production
+spec:
+  targetNamespaces:
+    - fluxot-platform
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: red-hat-camel-k
+  namespace: fluxot-platform
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: integration
+    environment: production
+spec:
+  # Red Hat supported Camel K channel
+  channel: stable
+  installPlanApproval: Automatic
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  name: red-hat-camel-k
+  # startingCSV: red-hat-camel-k-operator.v1.10.7
+  config:
+    env:
+      # Ensure Camel K builder cache is persistent across restarts
+      - name: CAMEL_K_BUILD_PUBLISH_STRATEGY
+        value: Spectrum
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"

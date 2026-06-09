@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  =============================================================================
+  Flux OT Platform — ActiveMQ Artemis broker.xml
+  =============================================================================
+  Roles:
+    - MQTT listener: 1883 (plain), 8883 (TLS) — edge skid connections
+    - AMQP listener: 5672 — internal platform connections
+    - Web console: 8161 (management)
+
+  Addresses: fluxot.# (durable, paging-enabled, authenticated)
+  HA mode:   Primary/Backup pair sharing a NFS/shared-nothing journal
+
+  Authentication: login.config (JAAS) + users.properties
+  Authorisation:  Per-address ACL via security-settings
+  =============================================================================
+-->
+<configuration xmlns="urn:activemq"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+
+  <!-- =========================================================== -->
+  <!--  Core settings                                              -->
+  <!-- =========================================================== -->
+  <core xmlns="urn:activemq:core"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="urn:activemq:core /schema/artemis-core.xsd">
+
+    <name>fluxot-mqtt-broker</name>
+    <persistence-enabled>true</persistence-enabled>
+
+    <!-- =========================================================== -->
+    <!--  Journal (async-io, 2 GiB max)                             -->
+    <!-- =========================================================== -->
+    <journal-type>ASYNCIO</journal-type>
+    <bindings-directory>./data/bindings</bindings-directory>
+    <journal-directory>./data/journal</journal-directory>
+    <large-messages-directory>./data/large-messages</large-messages-directory>
+    <paging-directory>./data/paging</paging-directory>
+
+    <journal-datasync>true</journal-datasync>
+    <journal-min-files>2</journal-min-files>
+    <journal-pool-files>10</journal-pool-files>
+    <journal-file-size>10485760</journal-file-size>    <!-- 10 MiB -->
+    <journal-buffer-timeout>500000</journal-buffer-timeout>
+    <journal-max-io>4096</journal-max-io>
+    <journal-max-size>2147483648</journal-max-size>    <!-- 2 GiB -->
+
+    <disk-scan-period>5000</disk-scan-period>
+    <max-disk-usage>90</max-disk-usage>
+    <critical-analyzer>true</critical-analyzer>
+    <critical-analyzer-timeout>120000</critical-analyzer-timeout>
+    <critical-analyzer-check-period>60000</critical-analyzer-check-period>
+    <critical-analyzer-policy>HALT</critical-analyzer-policy>
+
+    <!-- =========================================================== -->
+    <!--  Listeners                                                  -->
+    <!-- =========================================================== -->
+    <acceptors>
+      <!-- MQTT plain — edge skids on-site (unencrypted, internal network only) -->
+      <acceptor name="mqtt">
+        tcp://0.0.0.0:1883?protocols=MQTT;tcpSendBufferSize=1048576;tcpReceiveBufferSize=1048576;mqttSessionScanInterval=500;anycastPrefix=jms.queue.;multicastPrefix=jms.topic.
+      </acceptor>
+
+      <!-- MQTT over TLS — edge skids on public/WAN links -->
+      <acceptor name="mqtt-ssl">
+        tcp://0.0.0.0:8883?protocols=MQTT;sslEnabled=true;keyStorePath=/opt/artemis/certs/broker.keystore.p12;keyStorePassword=${env:KEYSTORE_PASSWORD};trustStorePath=/opt/artemis/certs/broker.truststore.p12;trustStorePassword=${env:TRUSTSTORE_PASSWORD};needClientAuth=false;tcpSendBufferSize=1048576;tcpReceiveBufferSize=1048576
+      </acceptor>
+
+      <!-- AMQP — internal platform services (Kafka bridge, alert processor) -->
+      <acceptor name="amqp">
+        tcp://0.0.0.0:5672?protocols=AMQP;amqpCredits=1000;amqpLowCredits=300;amqpDuplicateDetection=true;amqpMinLargeMessageSize=102400
+      </acceptor>
+
+      <!-- In-VM connector for embedded use -->
+      <acceptor name="invm">
+        vm://0
+      </acceptor>
+    </acceptors>
+
+    <!-- =========================================================== -->
+    <!--  Security                                                   -->
+    <!-- =========================================================== -->
+    <security-enabled>true</security-enabled>
+    <security-invalidation-interval>10000</security-invalidation-interval>
+
+    <!-- JAAS login module — points to login.config on classpath -->
+    <security-settings>
+      <!-- fluxot.# — grant specific roles access -->
+      <security-setting match="fluxot.#">
+        <!-- edge devices: publish telemetry, alerts, heartbeat, writeback -->
+        <permission type="send"
+                    roles="edge-device, platform-service, admin"/>
+        <!-- platform services: consume everything -->
+        <permission type="consume"
+                    roles="platform-service, admin"/>
+        <!-- platform/admin: manage queues -->
+        <permission type="createDurableQueue"
+                    roles="platform-service, admin"/>
+        <permission type="deleteDurableQueue"
+                    roles="admin"/>
+        <permission type="createNonDurableQueue"
+                    roles="edge-device, platform-service, admin"/>
+        <permission type="deleteNonDurableQueue"
+                    roles="platform-service, admin"/>
+        <permission type="browse"
+                    roles="platform-service, admin"/>
+      </security-setting>
+
+      <!-- Management console — admin only -->
+      <security-setting match="activemq.management.#">
+        <permission type="manage"
+                    roles="admin"/>
+      </security-setting>
+    </security-settings>
+
+    <!-- =========================================================== -->
+    <!--  Address settings — paging, delivery, retry                -->
+    <!-- =========================================================== -->
+    <address-settings>
+      <!-- Default catch-all -->
+      <address-setting match="#">
+        <dead-letter-address>DLQ</dead-letter-address>
+        <expiry-address>ExpiryQueue</expiry-address>
+        <redelivery-delay>5000</redelivery-delay>
+        <redelivery-multiplier>2.0</redelivery-multiplier>
+        <max-redelivery-delay>60000</max-redelivery-delay>
+        <max-delivery-attempts>3</max-delivery-attempts>
+        <message-counter-history-day-limit>10</message-counter-history-day-limit>
+        <address-full-policy>PAGE</address-full-policy>
+        <auto-create-queues>true</auto-create-queues>
+        <auto-delete-queues>false</auto-delete-queues>
+        <auto-create-addresses>true</auto-create-addresses>
+        <auto-delete-addresses>false</auto-delete-addresses>
+        <config-delete-queues>FORCE</config-delete-queues>
+      </address-setting>
+
+      <!-- Telemetry topics — high throughput, short TTL, paging -->
+      <address-setting match="fluxot.#.telemetry">
+        <dead-letter-address>fluxot.dlq</dead-letter-address>
+        <expiry-address>fluxot.expired</expiry-address>
+        <expiry-delay>604800000</expiry-delay>    <!-- 7 days -->
+        <max-size-bytes>1073741824</max-size-bytes>   <!-- 1 GiB per address -->
+        <page-size-bytes>10485760</page-size-bytes>   <!-- 10 MiB pages -->
+        <address-full-policy>PAGE</address-full-policy>
+        <message-counter-history-day-limit>7</message-counter-history-day-limit>
+        <max-delivery-attempts>2</max-delivery-attempts>
+        <redelivery-delay>1000</redelivery-delay>
+        <auto-create-queues>true</auto-create-queues>
+        <auto-delete-queues>false</auto-delete-queues>
+      </address-setting>
+
+      <!-- Alert topics — moderate throughput, longer TTL, durable -->
+      <address-setting match="fluxot.#.alerts">
+        <dead-letter-address>fluxot.dlq</dead-letter-address>
+        <expiry-delay>2592000000</expiry-delay>   <!-- 30 days -->
+        <max-size-bytes>536870912</max-size-bytes>    <!-- 512 MiB -->
+        <page-size-bytes>5242880</page-size-bytes>    <!-- 5 MiB pages -->
+        <address-full-policy>PAGE</address-full-policy>
+        <max-delivery-attempts>5</max-delivery-attempts>
+        <redelivery-delay>2000</redelivery-delay>
+        <redelivery-multiplier>2.0</redelivery-multiplier>
+        <auto-create-queues>true</auto-create-queues>
+        <auto-delete-queues>false</auto-delete-queues>
+      </address-setting>
+
+      <!-- Command topics — low throughput, strict ordering, durable -->
+      <address-setting match="fluxot.#.commands">
+        <dead-letter-address>fluxot.dlq</dead-letter-address>
+        <expiry-delay>604800000</expiry-delay>    <!-- 7 days -->
+        <max-size-bytes>104857600</max-size-bytes>    <!-- 100 MiB -->
+        <address-full-policy>FAIL</address-full-policy>  <!-- Fail fast — commands must not be lost -->
+        <max-delivery-attempts>10</max-delivery-attempts>
+        <redelivery-delay>500</redelivery-delay>
+        <redelivery-multiplier>1.5</redelivery-multiplier>
+        <max-redelivery-delay>30000</max-redelivery-delay>
+        <auto-create-queues>true</auto-create-queues>
+        <auto-delete-queues>false</auto-delete-queues>
+      </address-setting>
+
+      <!-- Heartbeat — short TTL, non-critical -->
+      <address-setting match="fluxot.#.heartbeat">
+        <dead-letter-address>fluxot.dlq</dead-letter-address>
+        <expiry-delay>86400000</expiry-delay>     <!-- 1 day -->
+        <max-size-bytes>104857600</max-size-bytes>
+        <address-full-policy>DROP</address-full-policy>
+        <max-delivery-attempts>1</max-delivery-attempts>
+        <auto-create-queues>true</auto-create-queues>
+      </address-setting>
+
+      <!-- Writeback — full audit, long retention -->
+      <address-setting match="fluxot.#.writeback">
+        <dead-letter-address>fluxot.dlq</dead-letter-address>
+        <expiry-delay>7776000000</expiry-delay>   <!-- 90 days -->
+        <max-size-bytes>536870912</max-size-bytes>
+        <page-size-bytes>5242880</page-size-bytes>
+        <address-full-policy>PAGE</address-full-policy>
+        <max-delivery-attempts>10</max-delivery-attempts>
+        <redelivery-delay>1000</redelivery-delay>
+        <auto-create-queues>true</auto-create-queues>
+        <auto-delete-queues>false</auto-delete-queues>
+      </address-setting>
+
+      <!-- DLQ — retain indefinitely, manual drain required -->
+      <address-setting match="fluxot.dlq">
+        <dead-letter-address>fluxot.dlq.undeliverable</dead-letter-address>
+        <expiry-delay>-1</expiry-delay>
+        <max-delivery-attempts>1</max-delivery-attempts>
+        <address-full-policy>PAGE</address-full-policy>
+        <auto-create-queues>true</auto-create-queues>
+        <auto-delete-queues>false</auto-delete-queues>
+      </address-setting>
+    </address-settings>
+
+    <!-- =========================================================== -->
+    <!--  Pre-defined queues/topics (durable)                        -->
+    <!-- =========================================================== -->
+    <addresses>
+      <address name="fluxot.dlq">
+        <anycast>
+          <queue name="fluxot.dlq">
+            <durable>true</durable>
+          </queue>
+        </anycast>
+      </address>
+      <address name="fluxot.expired">
+        <anycast>
+          <queue name="fluxot.expired">
+            <durable>true</durable>
+          </queue>
+        </anycast>
+      </address>
+      <address name="DLQ">
+        <anycast>
+          <queue name="DLQ">
+            <durable>true</durable>
+          </queue>
+        </anycast>
+      </address>
+      <address name="ExpiryQueue">
+        <anycast>
+          <queue name="ExpiryQueue">
+            <durable>true</durable>
+          </queue>
+        </anycast>
+      </address>
+    </addresses>
+
+    <!-- =========================================================== -->
+    <!--  HA Clustering — Primary/Backup (shared-nothing replication)-->
+    <!-- =========================================================== -->
+    <ha-policy>
+      <replication>
+        <!-- Primary broker — set to <slave> on the backup node -->
+        <master>
+          <check-for-live-server>true</check-for-live-server>
+          <!-- Requires backup to be running before primary starts -->
+          <wait-for-activation>true</wait-for-activation>
+        </master>
+      </replication>
+    </ha-policy>
+
+    <!-- Cluster connection for HA pair -->
+    <cluster-connections>
+      <cluster-connection name="fluxot-cluster">
+        <address>fluxot</address>
+        <connector-ref>netty-connector</connector-ref>
+        <retry-interval>500</retry-interval>
+        <retry-interval-multiplier>1.2</retry-interval-multiplier>
+        <max-retry-interval>5000</max-retry-interval>
+        <initial-connect-attempts>20</initial-connect-attempts>
+        <use-duplicate-detection>true</use-duplicate-detection>
+        <message-load-balancing>ON_DEMAND</message-load-balancing>
+        <max-hops>1</max-hops>
+        <static-connectors>
+          <connector-ref>backup-connector</connector-ref>
+        </static-connectors>
+      </cluster-connection>
+    </cluster-connections>
+
+    <!-- =========================================================== -->
+    <!--  Connectors (used for clustering and bridging)              -->
+    <!-- =========================================================== -->
+    <connectors>
+      <connector name="netty-connector">
+        tcp://0.0.0.0:61616
+      </connector>
+      <!-- Backup broker — set to the backup pod/host -->
+      <connector name="backup-connector">
+        tcp://fluxot-mqtt-broker-backup:61616
+      </connector>
+    </connectors>
+
+    <!-- =========================================================== -->
+    <!--  Management / metrics                                       -->
+    <!-- =========================================================== -->
+    <management-address>activemq.management</management-address>
+    <management-notification-address>activemq.notifications</management-notification-address>
+
+    <metrics>
+      <plugin class-name="org.apache.activemq.artemis.core.server.metrics.plugins.ArtemisPrometheusMetricsPlugin"/>
+    </metrics>
+
+    <!-- =========================================================== -->
+    <!--  Miscellaneous                                              -->
+    <!-- =========================================================== -->
+    <thread-pool-max-size>30</thread-pool-max-size>
+    <scheduled-thread-pool-max-size>5</scheduled-thread-pool-max-size>
+    <transaction-timeout>300000</transaction-timeout>
+    <message-expiry-scan-period>30000</message-expiry-scan-period>
+
+  </core>
+</configuration>

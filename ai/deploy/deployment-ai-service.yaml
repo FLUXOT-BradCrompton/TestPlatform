@@ -1,0 +1,345 @@
+# ===========================================================================
+# Flux OT — Unified AI Inference Service Deployment
+# Runs both belt-rip and road-crossing inference in a single container.
+#
+# Namespace  : fluxot-ai
+# Replicas   : 2  (HA — active/active, models cached on shared PVC)
+# Resources  : 2 CPU / 4Gi  (CPU inference default)
+# GPU support: see commented nodeSelector / resource sections below
+#
+# Apply:
+#   oc apply -f pvc-models.yaml      # create PVC first
+#   oc apply -f deployment-ai-service.yaml
+# ===========================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluxot-ai-inference
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-ai-inference
+    app.kubernetes.io/name: fluxot-ai-inference
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ai-inference
+    app.kubernetes.io/version: "1.0.0"
+    environment: production
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    openshift.io/description: "Flux OT AI inference service — belt rip detection and road crossing safety"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fluxot-ai-inference
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: fluxot-ai-inference
+        app.kubernetes.io/name: fluxot-ai-inference
+        app.kubernetes.io/part-of: fluxot-platform
+        app.kubernetes.io/component: ai-inference
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Run as non-root (matches Dockerfile USER fluxot uid=1001)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      serviceAccountName: fluxot-ai-sa
+
+      # Topology spread: distribute replicas across availability zones
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: fluxot-ai-inference
+
+      # Init container: pre-warm model from shared PVC (or download from MLflow)
+      initContainers:
+        - name: model-init
+          image: registry.fluxot.internal/fluxot-ai-inference:1.0.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -c
+            - |
+              import os, pathlib, sys
+              belt_path = pathlib.Path("/models/belt_rip")
+              crossing_path = pathlib.Path("/models/road_crossing")
+              belt_path.mkdir(parents=True, exist_ok=True)
+              crossing_path.mkdir(parents=True, exist_ok=True)
+              # Validate model artifacts exist; if not, trigger synthetic training
+              if not (belt_path / "rf_model.joblib").exists():
+                  print("Belt rip model not found — running bootstrap training ...", flush=True)
+                  sys.path.insert(0, "/app")
+                  from ai.belt_rip.training import BeltRipTrainingPipeline
+                  BeltRipTrainingPipeline().run(
+                      data_path=None,
+                      output_path=str(belt_path),
+                      n_synthetic_samples=15000,
+                  )
+              if not (crossing_path / "crossing_model.joblib").exists():
+                  print("Crossing model not found — running bootstrap training ...", flush=True)
+                  sys.path.insert(0, "/app")
+                  from ai.road_crossing.training import RoadCrossingTrainingPipeline
+                  RoadCrossingTrainingPipeline().run(
+                      data_path=None,
+                      output_path=str(crossing_path),
+                  )
+              print("Model init complete.", flush=True)
+          env:
+            - name: PYTHONPATH
+              value: /app
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: fluxot-ai-config
+                  key: mlflow_tracking_uri
+            - name: LOCAL_MODEL_REGISTRY_PATH
+              value: /tmp/fluxot_model_registry
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "3Gi"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: ai-inference
+          image: registry.fluxot.internal/fluxot-ai-inference:1.0.0
+          imagePullPolicy: IfNotPresent
+
+          # Unified service runs both belt-rip and road-crossing endpoints
+          # on port 8080. A second internal port 8081 is used by road-crossing
+          # sub-routes when running as a combined service.
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # Identity
+            - name: PYTHONPATH
+              value: /app
+
+            # MLflow
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: fluxot-ai-config
+                  key: mlflow_tracking_uri
+
+            # Model configuration
+            - name: MODEL_NAME
+              value: belt_rip_detector
+            - name: CROSSING_MODEL_NAME
+              value: road_crossing_safety
+            - name: MODEL_STAGE
+              value: Production
+            - name: LOCAL_MODEL_PATH
+              value: /models/belt_rip
+            - name: CROSSING_LOCAL_MODEL_PATH
+              value: /models/road_crossing
+
+            # Kafka
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: fluxot-ai-config
+                  key: kafka_bootstrap_servers
+            - name: KAFKA_CONSUMER_GROUP
+              value: fluxot-ai-combined
+
+            # Security
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fluxot-ai-secrets
+                  key: admin_api_key
+
+            # Runtime
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: LOG_LEVEL
+              value: INFO
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          # --------------- GPU support (uncomment to enable) ---------------
+          # resources:
+          #   requests:
+          #     cpu: "1"
+          #     memory: "2Gi"
+          #     nvidia.com/gpu: "1"
+          #   limits:
+          #     cpu: "4"
+          #     memory: "8Gi"
+          #     nvidia.com/gpu: "1"
+          # -------------------------------------------------------------------
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+            - name: tmp-dir
+              mountPath: /tmp
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 18  # allow up to 3 minutes for model load
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # model writes to /models PVC
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: fluxot-ai-models-pvc
+        - name: tmp-dir
+          emptyDir:
+            sizeLimit: "500Mi"
+
+      # --- GPU node selector (uncomment if GPU nodes are available) ---
+      # nodeSelector:
+      #   accelerator: nvidia-tesla-t4
+      # tolerations:
+      #   - key: nvidia.com/gpu
+      #     operator: Exists
+      #     effect: NoSchedule
+      # -------------------------------------------------------------------
+
+      # Prefer to schedule on infra nodes if tainted
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          operator: Exists
+          effect: NoSchedule
+
+      imagePullSecrets:
+        - name: fluxot-registry-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxot-ai-inference
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-ai-inference
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/component: ai-inference
+    environment: production
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+spec:
+  selector:
+    app: fluxot-ai-inference
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+# OpenShift Route — exposes the inference API externally (TLS edge termination)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: fluxot-ai-inference
+  namespace: fluxot-ai
+  labels:
+    app: fluxot-ai-inference
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+  annotations:
+    haproxy.router.openshift.io/timeout: "30s"
+    haproxy.router.openshift.io/balance: roundrobin
+spec:
+  host: ai.fluxot.internal
+  to:
+    kind: Service
+    name: fluxot-ai-inference
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+# ServiceAccount for the AI pods
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluxot-ai-sa
+  namespace: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+---
+# ConfigMap — non-secret configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-ai-config
+  namespace: fluxot-ai
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+    environment: production
+data:
+  mlflow_tracking_uri: "http://fluxot-mlflow.fluxot-ai.svc.cluster.local:5000"
+  kafka_bootstrap_servers: "kafka-cluster-kafka-bootstrap.fluxot-messaging.svc.cluster.local:9092"
+  belt_rip_topic_pattern: "fluxot\\..*\\.BELT_RIP_MONITOR\\..*\\.telemetry"
+  road_crossing_topic_pattern: "fluxot\\..*\\.ROAD_CROSSING\\..*\\.telemetry"

@@ -1,0 +1,215 @@
+# =============================================================================
+# Flux OT Edge Layer – Local Development Docker Compose
+#
+# Services:
+#   mosquitto      – Eclipse Mosquitto 2.0 MQTT broker
+#   opcua-server   – Python asyncua OPC-UA simulation server
+#   belt-rip       – Belt Rip Monitor edge service (SIMULATE=true)
+#   road-crossing  – Road Crossing edge service (SIMULATE=true)
+#   grafana        – Grafana for local dashboard visualisation
+#
+# Usage:
+#   docker compose -f edge/docker-compose.dev.yml up --build
+# =============================================================================
+
+version: "3.9"
+
+networks:
+  fluxot-edge:
+    driver: bridge
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  grafana-storage:
+
+# ---------------------------------------------------------------------------
+# Common environment shared by edge services
+# ---------------------------------------------------------------------------
+x-common-edge-env: &common-edge-env
+  SITE_ID: "SITE_DEV"
+  SKID_ID: "SKID_DEV"
+  MQTT_BROKER_HOST: mosquitto
+  MQTT_BROKER_PORT: "1883"
+  MQTT_USE_TLS: "false"
+  MQTT_QOS: "1"
+  OPCUA_ENDPOINT: "opc.tcp://opcua-server:4840"
+  OPCUA_SECURITY_POLICY: "None"
+  OPCUA_SECURITY_MODE: "None"
+  POLL_INTERVAL_MS: "500"
+  BUFFER_SIZE: "1000"
+  LOG_LEVEL: "INFO"
+  HEARTBEAT_INTERVAL_S: "30"
+  SIMULATE: "true"
+
+services:
+
+  # -------------------------------------------------------------------------
+  # MQTT Broker
+  # -------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: fluxot-mosquitto
+    restart: unless-stopped
+    networks:
+      - fluxot-edge
+    ports:
+      - "1883:1883"
+      - "9001:9001"      # WebSocket (optional)
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-t", "healthcheck", "-m", "ping", "-q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # OPC-UA Simulation Server
+  # -------------------------------------------------------------------------
+  opcua-server:
+    build:
+      context: ..
+      dockerfile: edge/opcua_simulator/Dockerfile
+    image: fluxot/opcua-simulator:dev
+    container_name: fluxot-opcua-simulator
+    restart: unless-stopped
+    networks:
+      - fluxot-edge
+    ports:
+      - "4840:4840"
+    environment:
+      OPCUA_ENDPOINT: "opc.tcp://0.0.0.0:4840"
+    healthcheck:
+      test: >
+        python -c "
+        import asyncio, sys;
+        from asyncua import Client;
+        async def chk():
+            async with Client('opc.tcp://localhost:4840') as c: pass;
+        asyncio.run(chk())
+        " 2>/dev/null && echo OK || exit 1
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  # -------------------------------------------------------------------------
+  # Belt Rip Monitor
+  # -------------------------------------------------------------------------
+  belt-rip:
+    build:
+      context: ..
+      dockerfile: edge/belt_rip_monitor/Dockerfile
+    image: fluxot/belt-rip-monitor:dev
+    container_name: fluxot-belt-rip
+    restart: unless-stopped
+    networks:
+      - fluxot-edge
+    ports:
+      - "9091:9090"      # Prometheus metrics
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      opcua-server:
+        condition: service_healthy
+    environment:
+      <<: *common-edge-env
+      SKID_ID: "BELT_RIP_001"
+      SKID_TYPE: "BELT_RIP"
+      BELT_ID: "BELT_001"
+      BELT_WIDTH_MM: "1200.0"
+      BELT_SPEED_MS: "3.5"
+      BELT_LENGTH_M: "500.0"
+      SENSOR_COUNT: "8"
+      ACOUSTIC_SENSOR_COUNT: "4"
+      LOAD_CELL_COUNT: "2"
+      VISION_ENABLED: "false"
+      RIP_DETECTION_THRESHOLD: "0.75"
+      EMERGENCY_STOP_ENABLED: "true"
+      EMERGENCY_STOP_NODE_ID: "ns=2;s=BeltControl.EmergencyStop"
+      SPEED_SETPOINT_NODE_ID: "ns=2;s=BeltControl.SpeedSetpoint"
+      STATUS_NODE_ID: "ns=2;s=BeltStatus.Running"
+      AI_ENABLED: "false"
+      MAINTENANCE_MODE: "false"
+      SIMULATE: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/metrics"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # -------------------------------------------------------------------------
+  # Road Crossing
+  # -------------------------------------------------------------------------
+  road-crossing:
+    build:
+      context: ..
+      dockerfile: edge/road_crossing/Dockerfile
+    image: fluxot/road-crossing:dev
+    container_name: fluxot-road-crossing
+    restart: unless-stopped
+    networks:
+      - fluxot-edge
+    ports:
+      - "9092:9090"      # Prometheus metrics
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      opcua-server:
+        condition: service_healthy
+    environment:
+      <<: *common-edge-env
+      SKID_ID: "CROSSING_001"
+      SKID_TYPE: "ROAD_CROSSING"
+      CROSSING_ID: "CROSSING_001"
+      CROSSING_NAME: "Main Haul Road Crossing"
+      BELT_SPEED_MS: "3.5"
+      BELT_WIDTH_MM: "1200.0"
+      LIDAR_COUNT: "2"
+      RADAR_COUNT: "2"
+      CAMERA_COUNT: "4"
+      LOOP_DETECTOR_COUNT: "4"
+      BARRIER_COUNT: "2"
+      TRAFFIC_LIGHT_COUNT: "4"
+      SAFE_CROSSING_WINDOW_S: "30.0"
+      VEHICLE_CLEARANCE_TIME_S: "15.0"
+      VEHICLE_DETECTION_CONFIDENCE: "0.85"
+      BARRIER_OPEN_NODE_ID: "ns=2;s=CrossingControl.BarrierOpen"
+      BARRIER_CLOSE_NODE_ID: "ns=2;s=CrossingControl.BarrierClose"
+      TRAFFIC_LIGHT_NODE_ID: "ns=2;s=CrossingControl.TrafficLight"
+      BELT_STATUS_NODE_ID: "ns=2;s=BeltStatus.Running"
+      BELT_SPEED_NODE_ID: "ns=2;s=BeltStatus.Speed"
+      HAUL_TRUCK_MAX_SPEED_KMH: "40.0"
+      EMERGENCY_STOP_CROSSING_NODE_ID: "ns=2;s=CrossingControl.EmergencyStop"
+      SIMULATE: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/metrics"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # -------------------------------------------------------------------------
+  # Grafana (local dashboards)
+  # -------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: fluxot-grafana
+    restart: unless-stopped
+    networks:
+      - fluxot-edge
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: fluxot_dev
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: "grafana-mqtt-datasource"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      - mosquitto
