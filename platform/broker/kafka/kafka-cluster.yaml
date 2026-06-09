@@ -1,0 +1,360 @@
+# =============================================================================
+# Flux OT Platform — AMQ Streams (Strimzi) Kafka Cluster Definition
+# =============================================================================
+# Apply with: oc apply -f kafka-cluster.yaml -n fluxot
+#
+# This manifest deploys a production-ready 3-broker Kafka cluster with:
+#   - 3 ZooKeeper nodes (Kafka 3.x compatibility mode)
+#   - TLS listeners for internal and external traffic
+#   - SCRAM-SHA-512 authentication
+#   - Simple authorisation (ACL-based)
+#   - JMX metrics exported for Prometheus
+#   - 100 Gi persistent storage per broker
+#   - Entity Operator for topic/user management
+#
+# KRaft mode (Kafka without ZooKeeper) is available from Strimzi 0.39+.
+# To enable, remove the zookeeper stanza, add mode: KRaft to the kafka spec,
+# and set controller.quorum.voters in kafka.config.
+# =============================================================================
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: fluxot-kafka
+  namespace: fluxot
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/instance: fluxot-kafka
+    app.kubernetes.io/part-of: fluxot-platform
+    app.kubernetes.io/managed-by: strimzi
+spec:
+  # ---------------------------------------------------------------------------
+  # Kafka brokers
+  # ---------------------------------------------------------------------------
+  kafka:
+    version: 3.7.0
+    replicas: 3
+
+    # -- Listeners -----------------------------------------------------------
+    listeners:
+      # Internal plain listener (pod-to-pod within the namespace)
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+        authentication:
+          type: scram-sha-512
+
+      # Internal TLS listener (cross-namespace or service mesh)
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: scram-sha-512
+        configuration:
+          brokerCertChainAndKey:
+            secretName: fluxot-kafka-broker-tls
+            certificate: tls.crt
+            key: tls.key
+
+      # External listener via OpenShift Route (HTTPS/SNI passthrough)
+      - name: external
+        port: 9094
+        type: route
+        tls: true
+        authentication:
+          type: scram-sha-512
+
+    # -- Authorization -------------------------------------------------------
+    authorization:
+      type: simple
+      superUsers:
+        - User:fluxot-admin
+        - User:fluxot-platform-api
+
+    # -- Broker configuration ------------------------------------------------
+    config:
+      # Replication and durability
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+
+      # Performance
+      num.io.threads: 8
+      num.network.threads: 5
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600
+
+      # Compression default
+      compression.type: snappy
+
+      # Log settings
+      log.retention.hours: 168          # 7 days default (per-topic overrides apply)
+      log.segment.bytes: 1073741824     # 1 GiB segments
+      log.retention.check.interval.ms: 300000
+
+      # Automatic topic creation disabled — managed via KafkaTopic CRDs
+      auto.create.topics.enable: "false"
+      delete.topic.enable: "true"
+
+      # Producer idempotence
+      enable.idempotence: "true"
+
+      # Consumer group rebalance tuning
+      group.initial.rebalance.delay.ms: 3000
+
+    # -- JVM options ---------------------------------------------------------
+    jvmOptions:
+      "-Xms": 2048m
+      "-Xmx": 2048m
+      "-XX":
+        UseG1GC: true
+        MaxGCPauseMillis: "20"
+        InitiatingHeapOccupancyPercent: "35"
+        ExplicitGCInvokesConcurrent: true
+        DisableExplicitGC: false
+
+    # -- Resources -----------------------------------------------------------
+    resources:
+      requests:
+        memory: 4Gi
+        cpu: "1"
+      limits:
+        memory: 4Gi
+        cpu: "2"
+
+    # -- Storage (production: persistent 100 Gi per broker) ------------------
+    storage:
+      type: persistent-claim
+      size: 100Gi
+      class: gp2           # Replace with your StorageClass (e.g. gp3-csi on AWS/ROSA)
+      deleteClaim: false
+
+    # -- Rack awareness (spread pods across AZs) -----------------------------
+    rack:
+      topologyKey: topology.kubernetes.io/zone
+
+    # -- Metrics (Prometheus JMX exporter) -----------------------------------
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: fluxot-kafka-metrics-config
+          key: kafka-metrics-config.yml
+
+  # ---------------------------------------------------------------------------
+  # ZooKeeper (Kafka 3.x with ZK — remove for KRaft mode)
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    replicas: 3
+
+    jvmOptions:
+      "-Xms": 512m
+      "-Xmx": 512m
+
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: "250m"
+      limits:
+        memory: 1Gi
+        cpu: "500m"
+
+    storage:
+      type: persistent-claim
+      size: 20Gi
+      class: gp2
+      deleteClaim: false
+
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: fluxot-kafka-metrics-config
+          key: zookeeper-metrics-config.yml
+
+  # ---------------------------------------------------------------------------
+  # Entity Operator (manages KafkaTopic and KafkaUser CRDs)
+  # ---------------------------------------------------------------------------
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "100m"
+        limits:
+          memory: 512Mi
+          cpu: "500m"
+      reconciliationIntervalSeconds: 120
+
+    userOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "100m"
+        limits:
+          memory: 512Mi
+          cpu: "500m"
+      reconciliationIntervalSeconds: 120
+
+---
+# =============================================================================
+# Prometheus metrics ConfigMap for Kafka and ZooKeeper JMX exporter
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluxot-kafka-metrics-config
+  namespace: fluxot
+  labels:
+    app.kubernetes.io/part-of: fluxot-platform
+data:
+  kafka-metrics-config.yml: |
+    # Kafka broker JMX metrics — key metrics for dashboarding
+    lowercaseOutputName: true
+    rules:
+      # Broker state
+      - pattern: kafka.server<type=KafkaServer, name=BrokerState><>Value
+        name: kafka_server_broker_state
+        help: "Kafka broker state"
+        type: GAUGE
+
+      # Under-replicated partitions (critical alert if > 0)
+      - pattern: kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value
+        name: kafka_server_under_replicated_partitions
+        type: GAUGE
+
+      # Active controller count
+      - pattern: kafka.controller<type=KafkaController, name=ActiveControllerCount><>Value
+        name: kafka_controller_active_count
+        type: GAUGE
+
+      # Request metrics
+      - pattern: kafka.network<type=RequestMetrics, name=RequestsPerSec, request=(.+)><>Count
+        name: kafka_network_requests_total
+        labels:
+          request: "$1"
+        type: COUNTER
+
+      # Topic-level message rate
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec, topic=(.+)><>Count
+        name: kafka_topic_messages_in_total
+        labels:
+          topic: "$1"
+        type: COUNTER
+
+      # Consumer group lag (via JMX consumer metrics)
+      - pattern: kafka.consumer<type=consumer-fetch-manager-metrics, client-id=(.+), topic=(.+), partition=(.+)><>records-lag
+        name: kafka_consumer_records_lag
+        labels:
+          client_id: "$1"
+          topic: "$2"
+          partition: "$3"
+        type: GAUGE
+
+      # Log size
+      - pattern: kafka.log<type=Log, name=Size, topic=(.+), partition=(.+)><>Value
+        name: kafka_log_size_bytes
+        labels:
+          topic: "$1"
+          partition: "$2"
+        type: GAUGE
+
+  zookeeper-metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+)><>(\\w+)"
+        name: "zookeeper_$2"
+        type: GAUGE
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+), name1=replica.(\\d+)><>(\\w+)"
+        name: "zookeeper_$3"
+        labels:
+          replicaId: "$2"
+        type: GAUGE
+
+---
+# =============================================================================
+# KafkaUser: Platform API service account
+# =============================================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: fluxot-platform-api
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # Consumer group
+      - resource:
+          type: group
+          name: fluxot-platform-api
+          patternType: literal
+        operations: [Read, Describe]
+
+      # All fluxot.* topics — read and write
+      - resource:
+          type: topic
+          name: fluxot.
+          patternType: prefix
+        operations: [Read, Write, Describe, Create, Alter]
+
+      # Dead letter queue
+      - resource:
+          type: topic
+          name: fluxot.dlq
+          patternType: literal
+        operations: [Read, Write, Describe]
+
+---
+# =============================================================================
+# KafkaUser: MQTT bridge service account
+# =============================================================================
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: fluxot-mqtt-bridge
+  namespace: fluxot
+  labels:
+    strimzi.io/cluster: fluxot-kafka
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: group
+          name: fluxot-mqtt-bridge
+          patternType: literal
+        operations: [Read, Describe]
+      - resource:
+          type: topic
+          name: fluxot.
+          patternType: prefix
+        operations: [Read, Write, Describe]
+
+---
+# =============================================================================
+# PodDisruptionBudget — ensure at least 2 brokers available during maintenance
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fluxot-kafka-pdb
+  namespace: fluxot
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      strimzi.io/cluster: fluxot-kafka
+      strimzi.io/kind: Kafka
